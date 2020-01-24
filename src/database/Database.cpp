@@ -5,6 +5,7 @@
 #include "database/Database.h"
 #include "crypto/Hex.h"
 #include "database/DatabaseConnectionString.h"
+#include "database/DatabaseTypeSpecificOperation.h"
 #include "main/Application.h"
 #include "main/Config.h"
 #include "overlay/StellarXDR.h"
@@ -17,31 +18,31 @@
 #include "herder/HerderPersistence.h"
 #include "herder/Upgrades.h"
 #include "history/HistoryManager.h"
-#include "ledger/AccountFrame.h"
-#include "ledger/DataFrame.h"
-#include "ledger/LedgerHeaderFrame.h"
-#include "ledger/OfferFrame.h"
-#include "ledger/TrustFrame.h"
+#include "ledger/LedgerHeaderUtils.h"
+#include "ledger/LedgerTxn.h"
 #include "main/ExternalQueue.h"
 #include "main/PersistentState.h"
 #include "overlay/BanManager.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/PeerManager.h"
 #include "transactions/TransactionFrame.h"
 
 #include "medida/counter.h"
 #include "medida/metrics_registry.h"
 #include "medida/timer.h"
 
+#include <lib/soci/src/backends/sqlite3/soci-sqlite3.h>
+#ifdef USE_POSTGRES
+#include <lib/soci/src/backends/postgresql/soci-postgresql.h>
+#endif
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
-extern "C" void register_factory_sqlite3();
-
-#ifdef USE_POSTGRES
-extern "C" void register_factory_postgresql();
-#endif
+extern "C" int
+sqlite3_carray_init(sqlite_api::sqlite3* db, char** pzErrMsg,
+                    const sqlite_api::sqlite3_api_routines* pApi);
 
 // NOTE: soci will just crash and not throw
 //  if you misname a column in a query. yay!
@@ -54,13 +55,55 @@ using namespace std;
 
 bool Database::gDriversRegistered = false;
 
-static unsigned long const SCHEMA_VERSION = 7;
+// smallest schema version supported
+static unsigned long const MIN_SCHEMA_VERSION = 9;
+static unsigned long const SCHEMA_VERSION = 12;
 
-static void
-setSerializable(soci::session& sess)
+// These should always match our compiled version precisely, since we are
+// using a bundled version to get access to carray(). But in case someone
+// overrides that or our build configuration changes, it's nicer to get a
+// more-precise version-mismatch error message than a runtime crash due
+// to using SQLite features that aren't supported on an old version.
+static int const MIN_SQLITE_MAJOR_VERSION = 3;
+static int const MIN_SQLITE_MINOR_VERSION = 26;
+static int const MIN_SQLITE_VERSION =
+    (1000000 * MIN_SQLITE_MAJOR_VERSION) + (1000 * MIN_SQLITE_MINOR_VERSION);
+
+// PostgreSQL pre-10.0 actually used its "minor number" as a major one
+// (meaning: 9.4 and 9.5 were considered different major releases, with
+// compatibility differences and so forth). After 10.0 they started doing
+// what everyone else does, where 10.0 and 10.1 were only "minor". Either
+// way though, we have a minimum minor version.
+static int const MIN_POSTGRESQL_MAJOR_VERSION = 9;
+static int const MIN_POSTGRESQL_MINOR_VERSION = 5;
+static int const MIN_POSTGRESQL_VERSION =
+    (10000 * MIN_POSTGRESQL_MAJOR_VERSION) +
+    (100 * MIN_POSTGRESQL_MINOR_VERSION);
+
+#ifdef USE_POSTGRES
+static std::string
+badPgVersion(int vers)
 {
-    sess << "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL "
-            "SERIALIZABLE";
+    std::ostringstream msg;
+    int maj = (vers / 10000);
+    int min = (vers - (maj * 10000)) / 100;
+    msg << "PostgreSQL version " << maj << '.' << min
+        << " is too old, must use at least " << MIN_POSTGRESQL_MAJOR_VERSION
+        << '.' << MIN_POSTGRESQL_MINOR_VERSION;
+    return msg.str();
+}
+#endif
+
+static std::string
+badSqliteVersion(int vers)
+{
+    std::ostringstream msg;
+    int maj = (vers / 1000000);
+    int min = (vers - (maj * 1000000)) / 1000;
+    msg << "SQLite version " << maj << '.' << min
+        << " is too old, must use at least " << MIN_SQLITE_MAJOR_VERSION << '.'
+        << MIN_SQLITE_MINOR_VERSION;
+    return msg.str();
 }
 
 void
@@ -76,13 +119,55 @@ Database::registerDrivers()
     }
 }
 
+// Helper class that confirms that we're running on a new-enough version
+// of each database type and tweaks some per-backend settings.
+class DatabaseConfigureSessionOp : public DatabaseTypeSpecificOperation<void>
+{
+    soci::session& mSession;
+
+  public:
+    DatabaseConfigureSessionOp(soci::session& sess) : mSession(sess)
+    {
+    }
+    void
+    doSqliteSpecificOperation(soci::sqlite3_session_backend* sq) override
+    {
+        int vers = sqlite_api::sqlite3_libversion_number();
+        if (vers < MIN_SQLITE_VERSION)
+        {
+            throw std::runtime_error(badSqliteVersion(vers));
+        }
+
+        mSession << "PRAGMA journal_mode = WAL";
+        // busy_timeout gives room for external processes
+        // that may lock the database for some time
+        mSession << "PRAGMA busy_timeout = 10000";
+
+        // Register the sqlite carray() extension we use for bulk operations.
+        sqlite3_carray_init(sq->conn_, nullptr, nullptr);
+    }
+#ifdef USE_POSTGRES
+    void
+    doPostgresSpecificOperation(soci::postgresql_session_backend* pg) override
+    {
+        int vers = PQserverVersion(pg->conn_);
+        if (vers < MIN_POSTGRESQL_VERSION)
+        {
+            throw std::runtime_error(badPgVersion(vers));
+        }
+        mSession
+            << "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL "
+               "SERIALIZABLE";
+    }
+#endif
+};
+
 Database::Database(Application& app)
     : mApp(app)
     , mQueryMeter(
           app.getMetrics().NewMeter({"database", "query", "exec"}, "query"))
     , mStatementsSize(
           app.getMetrics().NewCounter({"database", "memory", "statements"}))
-    , mEntryCache(4096)
     , mExcludedQueryTime(0)
     , mExcludedTotalTime(0)
     , mLastIdleQueryTime(0)
@@ -94,17 +179,8 @@ Database::Database(Application& app)
                            << removePasswordFromConnectionString(
                                   app.getConfig().DATABASE.value);
     mSession.open(app.getConfig().DATABASE.value);
-    if (isSqlite())
-    {
-        mSession << "PRAGMA journal_mode = WAL";
-        // busy_timeout gives room for external processes
-        // that may lock the database for some time
-        mSession << "PRAGMA busy_timeout = 10000";
-    }
-    else
-    {
-        setSerializable(mSession);
-    }
+    DatabaseConfigureSessionOp op(mSession);
+    doDatabaseTypeSpecificOperation(op);
 }
 
 void
@@ -112,62 +188,79 @@ Database::applySchemaUpgrade(unsigned long vers)
 {
     clearPreparedStatementCache();
 
+    soci::transaction tx(mSession);
     switch (vers)
     {
-    case 2:
-        HerderPersistence::dropAll(*this);
+    case 10:
+        // add tracking table information
+        mApp.getHerderPersistence().createQuorumTrackingTable(mSession);
         break;
-
-    case 3:
-        DataFrame::dropAll(*this);
-        break;
-
-    case 4:
-        BanManager::dropAll(*this);
-        mSession << "CREATE INDEX scpquorumsbyseq ON scpquorums(lastledgerseq)";
-        break;
-
-    case 5:
-        try
+    case 11:
+        if (!mApp.getConfig().MODE_USES_IN_MEMORY_LEDGER)
         {
-            mSession << "ALTER TABLE accountdata ADD lastmodified INT NOT NULL "
-                        "DEFAULT 0;";
-        }
-        catch (soci::soci_error& e)
-        {
-            if (std::string(e.what()).find("lastmodified") == std::string::npos)
-            {
-                throw;
-            }
+            mSession << "DROP INDEX IF EXISTS bestofferindex;";
+            mSession << "CREATE INDEX bestofferindex ON offers "
+                        "(sellingasset,buyingasset,price,offerid);";
         }
         break;
+    case 12:
+        if (!isSqlite())
+        {
+            // Set column collations to "C" if postgres; sqlite doesn't support
+            // altering them at all (and the defaults are correct anyways).
+            mSession << "ALTER TABLE accounts "
+                     << "ALTER COLUMN accountid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\"";
 
-    case 6:
-        mSession << "ALTER TABLE peers ADD flags INT NOT NULL DEFAULT 0";
+            mSession << "ALTER TABLE ledgerheaders "
+                     << "ALTER COLUMN ledgerhash "
+                     << "TYPE CHARACTER(64) COLLATE \"C\"";
+
+            mSession << "ALTER TABLE accountdata "
+                     << "ALTER COLUMN accountid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN dataname "
+                     << "TYPE VARCHAR(88) COLLATE \"C\"";
+
+            mSession << "ALTER TABLE offers "
+                     << "ALTER COLUMN sellerid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN buyingasset "
+                     << "TYPE TEXT COLLATE \"C\", "
+                     << "ALTER COLUMN sellingasset "
+                     << "TYPE TEXT COLLATE \"C\"";
+
+            mSession << "ALTER TABLE trustlines "
+                     << "ALTER COLUMN accountid "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN issuer "
+                     << "TYPE VARCHAR(56) COLLATE \"C\", "
+                     << "ALTER COLUMN assetcode "
+                     << "TYPE VARCHAR(12) COLLATE \"C\"";
+        }
+
+        // With inflation disabled, it's not worth keeping
+        // the accountbalances index around.
+        mSession << "DROP INDEX IF EXISTS accountbalances";
         break;
-
-    case 7:
-        Upgrades::dropAll(*this);
-        mSession << "ALTER TABLE accounts ADD buyingliabilities BIGINT "
-                    "CHECK (buyingliabilities >= 0)";
-        mSession << "ALTER TABLE accounts ADD sellingliabilities BIGINT "
-                    "CHECK (sellingliabilities >= 0)";
-        mSession << "ALTER TABLE trustlines ADD buyingliabilities BIGINT "
-                    "CHECK (buyingliabilities >= 0)";
-        mSession << "ALTER TABLE trustlines ADD sellingliabilities BIGINT "
-                    "CHECK (sellingliabilities >= 0)";
-        break;
-
     default:
         throw std::runtime_error("Unknown DB schema version");
-        break;
     }
+    tx.commit();
 }
 
 void
 Database::upgradeToCurrentSchema()
 {
     auto vers = getDBSchemaVersion();
+    if (vers < MIN_SCHEMA_VERSION)
+    {
+        std::string s = ("DB schema version " + std::to_string(vers) +
+                         " is older than minimum supported schema " +
+                         std::to_string(MIN_SCHEMA_VERSION));
+        throw std::runtime_error(s);
+    }
+
     if (vers > SCHEMA_VERSION)
     {
         std::string s = ("DB schema version " + std::to_string(vers) +
@@ -183,6 +276,7 @@ Database::upgradeToCurrentSchema()
         applySchemaUpgrade(vers);
         putSchemaVersion(vers);
     }
+    CLOG(INFO, "Database") << "DB schema is in current version";
     assert(vers == SCHEMA_VERSION);
 }
 
@@ -196,11 +290,11 @@ Database::putSchemaVersion(unsigned long vers)
 unsigned long
 Database::getDBSchemaVersion()
 {
-    auto vstr =
-        mApp.getPersistentState().getState(PersistentState::kDatabaseSchema);
     unsigned long vers = 0;
     try
     {
+        auto vstr = mApp.getPersistentState().getState(
+            PersistentState::kDatabaseSchema);
         vers = std::stoul(vstr);
     }
     catch (...)
@@ -208,7 +302,8 @@ Database::getDBSchemaVersion()
     }
     if (vers == 0)
     {
-        throw std::runtime_error("No DB schema version found, try --newdb");
+        throw std::runtime_error(
+            "No DB schema version found, try stellar-core new-db");
     }
     return vers;
 }
@@ -259,6 +354,16 @@ Database::getUpdateTimer(std::string const& entityName)
         .TimeScope();
 }
 
+medida::TimerContext
+Database::getUpsertTimer(std::string const& entityName)
+{
+    mEntityTypes.insert(entityName);
+    mQueryMeter.Mark();
+    return mApp.getMetrics()
+        .NewTimer({"database", "upsert", entityName})
+        .TimeScope();
+}
+
 void
 Database::setCurrentTransactionReadOnly()
 {
@@ -276,6 +381,19 @@ Database::isSqlite() const
 {
     return mApp.getConfig().DATABASE.value.find("sqlite3:") !=
            std::string::npos;
+}
+
+std::string
+Database::getSimpleCollationClause() const
+{
+    if (isSqlite())
+    {
+        return "";
+    }
+    else
+    {
+        return " COLLATE \"C\" ";
+    }
 }
 
 bool
@@ -304,19 +422,47 @@ Database::initialize()
     // normally you do not want to touch this section as
     // schema updates are done in applySchemaUpgrade
 
+    if (isSqlite() && mApp.getConfig().DATABASE.value != "sqlite3://:memory:")
+    {
+        // When we're in non-memory (i.e. "disk") mode of SQLite we want to bump
+        // up the page size to 64k (the maximum supported). On fast SSDs / NVMe
+        // this actually is a slight speed-loss, but it's a significant win on
+        // slow disks (spinning platters, low-IOPS EBS, etc.)
+        //
+        // To do this we need to disable journalling, adjust the page_size, then
+        // vacuum and re-enable journalling. NB: WAL mode is _ignored_ in memory
+        // mode, so it's important that this code not run in memory mode, it'll
+        // disable all journalling and silently _not_ re-enable it.
+
+        mSession << "PRAGMA journal_mode = OFF";
+        mSession << "PRAGMA page_size = 65536";
+        mSession << "VACUUM";
+        mSession << "PRAGMA journal_mode = WAL";
+    }
+
     // only time this section should be modified is when
     // consolidating changes found in applySchemaUpgrade here
-    AccountFrame::dropAll(*this);
-    OfferFrame::dropAll(*this);
-    TrustFrame::dropAll(*this);
+    Upgrades::dropAll(*this);
+    if (!mApp.getConfig().MODE_USES_IN_MEMORY_LEDGER)
+    {
+        mApp.getLedgerTxnRoot().dropAccounts();
+        mApp.getLedgerTxnRoot().dropOffers();
+        mApp.getLedgerTxnRoot().dropTrustLines();
+        mApp.getLedgerTxnRoot().dropData();
+    }
     OverlayManager::dropAll(*this);
     PersistentState::dropAll(*this);
     ExternalQueue::dropAll(*this);
-    LedgerHeaderFrame::dropAll(*this);
+    LedgerHeaderUtils::dropAll(*this);
     TransactionFrame::dropAll(*this);
     HistoryManager::dropAll(*this);
-    BucketManager::dropAll(mApp);
-    putSchemaVersion(1);
+    HerderPersistence::dropAll(*this);
+    BanManager::dropAll(*this);
+    putSchemaVersion(MIN_SCHEMA_VERSION);
+
+    LOG(INFO) << "* ";
+    LOG(INFO) << "* The database has been initialized";
+    LOG(INFO) << "* ";
 }
 
 soci::session&
@@ -348,20 +494,12 @@ Database::getPool()
             LOG(DEBUG) << "Opening pool entry " << i;
             soci::session& sess = mPool->at(i);
             sess.open(c.value);
-            if (!isSqlite())
-            {
-                setSerializable(sess);
-            }
+            DatabaseConfigureSessionOp op(sess);
+            doDatabaseTypeSpecificOperation(op);
         }
     }
     assert(mPool);
     return *mPool;
-}
-
-cache::lru_cache<std::string, std::shared_ptr<LedgerEntry const>>&
-Database::getEntryCache()
-{
-    return mEntryCache;
 }
 
 class SQLLogContext : NonCopyable

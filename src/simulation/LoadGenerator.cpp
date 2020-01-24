@@ -4,26 +4,21 @@
 
 #include "simulation/LoadGenerator.h"
 #include "herder/Herder.h"
-#include "ledger/LedgerDelta.h"
 #include "ledger/LedgerManager.h"
+#include "ledger/LedgerTxn.h"
+#include "ledger/LedgerTxnEntry.h"
 #include "main/Config.h"
 #include "overlay/OverlayManager.h"
 #include "test/TestAccount.h"
 #include "test/TxTests.h"
+#include "transactions/TransactionUtils.h"
 #include "util/Logging.h"
 #include "util/Math.h"
 #include "util/Timer.h"
+#include "util/numeric.h"
 #include "util/types.h"
 
 #include "database/Database.h"
-
-#include "transactions/AllowTrustOpFrame.h"
-#include "transactions/ChangeTrustOpFrame.h"
-#include "transactions/CreateAccountOpFrame.h"
-#include "transactions/ManageOfferOpFrame.h"
-#include "transactions/PathPaymentOpFrame.h"
-#include "transactions/PaymentOpFrame.h"
-#include "transactions/TransactionFrame.h"
 
 #include "xdrpp/marshal.h"
 #include "xdrpp/printer.h"
@@ -41,20 +36,28 @@ namespace stellar
 using namespace std;
 using namespace txtest;
 
-// Units of load are is scheduled at 100ms intervals.
+// Units of load are scheduled at 100ms intervals.
 const uint32_t LoadGenerator::STEP_MSECS = 100;
-//
-const uint32_t LoadGenerator::TX_SUBMIT_MAX_TRIES = 1000;
+
+// If submission fails with txBAD_SEQ, attempt refreshing the account or
+// re-submitting a new payment
+const uint32_t LoadGenerator::TX_SUBMIT_MAX_TRIES = 10;
+
+// After successfully submitting desired load, wait a bit to let it get into the
+// ledger.
+const uint32_t LoadGenerator::TIMEOUT_NUM_LEDGERS = 20;
 
 LoadGenerator::LoadGenerator(Application& app)
-    : mMinBalance(0), mLastSecond(0), mApp(app)
+    : mMinBalance(0)
+    , mLastSecond(0)
+    , mApp(app)
+    , mTotalSubmitted(0)
+    , mLoadgenComplete(
+          mApp.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run"))
+    , mLoadgenFail(
+          mApp.getMetrics().NewMeter({"loadgen", "run", "failed"}, "run"))
 {
     createRootAccount();
-}
-
-LoadGenerator::~LoadGenerator()
-{
-    clear();
 }
 
 void
@@ -64,95 +67,67 @@ LoadGenerator::createRootAccount()
     {
         auto rootTestAccount = TestAccount::createRoot(mApp);
         mRoot = make_shared<TestAccount>(rootTestAccount);
-        auto res = loadAccount(mRoot, mApp.getDatabase());
-        if (!res)
+        if (!loadAccount(mRoot, mApp))
         {
             CLOG(ERROR, "LoadGen") << "Could not retrieve root account!";
         }
     }
 }
 
-uint32_t
+int64_t
 LoadGenerator::getTxPerStep(uint32_t txRate)
 {
-    // txRate is "per second"; we're running one "step" worth which is a
-    // fraction of txRate determined by STEP_MSECS. For example if txRate
-    // is 200 and STEP_MSECS is 100, then we want to do 20 tx per step.
-    uint32_t txPerStep = (txRate * STEP_MSECS / 1000);
+    if (!mStartTime)
+    {
+        throw std::runtime_error("Load generation start time must be set");
+    }
 
-    // There is a wrinkle here though which is that the tx-apply phase might
-    // well block timers for up to half the close-time; plus we'll be probably
-    // not be scheduled quite as often as we want due to the time it takes to
-    // run and the time the network is exchanging packets. So instead of a naive
-    // calculation based _just_ on target rate and STEP_MSECS, we also adjust
-    // based on how often we seem to be waking up and taking loadgen steps in
-    // reality.
     auto& stepMeter =
         mApp.getMetrics().NewMeter({"loadgen", "step", "count"}, "step");
     stepMeter.Mark();
-    auto stepsPerSecond = stepMeter.one_minute_rate();
-    if (stepMeter.count() > 10 && stepsPerSecond != 0)
+
+    auto now = mApp.getClock().now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - *mStartTime);
+    auto txs = bigDivide(elapsed.count(), txRate, 1000, Rounding::ROUND_DOWN);
+
+    if (txs <= mTotalSubmitted)
     {
-        txPerStep = static_cast<uint32_t>(txRate / stepsPerSecond);
+        return 0;
     }
 
-    // If we have a very low tx rate (eg. 2/sec) then the previous division will
-    // be zero and we'll never issue anything; what we need to do instead is
-    // dispatch 1 tx every "few steps" (eg. every 5 steps). We do this by random
-    // choice, weighted to the desired frequency.
-    if (txPerStep == 0)
-    {
-        txPerStep = rand_uniform(0U, 1000U) < (txRate * STEP_MSECS) ? 1 : 0;
-    }
-
-    return txPerStep;
-}
-
-bool
-LoadGenerator::maybeAdjustRate(double target, double actual, uint32_t& rate,
-                               bool increaseOk)
-{
-    if (actual == 0.0)
-    {
-        actual = 1.0;
-    }
-    double diff = target - actual;
-    double acceptableDeviation = 0.1 * target;
-    if (fabs(diff) > acceptableDeviation)
-    {
-        // Limit To doubling rate per adjustment period; even if it's measured
-        // as having more room to accelerate, it's likely we'll get a better
-        // measurement next time around, and we don't want to overshoot and
-        // thrash. Measurement is pretty noisy.
-        double pct = std::min(1.0, diff / actual);
-        auto incr = static_cast<int32_t>(pct * rate);
-        if (incr > 0 && !increaseOk)
-        {
-            return false;
-        }
-        CLOG(INFO, "LoadGen")
-            << (incr > 0 ? "+++ Increasing" : "--- Decreasing")
-            << " auto-tx target rate from " << rate << " to " << rate + incr;
-        rate += incr;
-        return true;
-    }
-    return false;
+    return txs - mTotalSubmitted;
 }
 
 void
-LoadGenerator::clear()
+LoadGenerator::reset()
 {
     mAccounts.clear();
     mRoot.reset();
+    mStartTime.reset();
+    mTotalSubmitted = 0;
+    mWaitTillCompleteForLedgers = 0;
+    mFailed = false;
 }
 
 // Schedule a callback to generateLoad() STEP_MSECS miliseconds from now.
 void
 LoadGenerator::scheduleLoadGeneration(bool isCreate, uint32_t nAccounts,
                                       uint32_t offset, uint32_t nTxs,
-                                      uint32_t txRate, uint32_t batchSize,
-                                      bool autoRate)
+                                      uint32_t txRate, uint32_t batchSize)
 {
+    // If previously scheduled step of load did not succeed, fail this loadgen
+    // run.
+    if (mFailed)
+    {
+        CLOG(ERROR, "LoadGen") << "Load generation failed, ensure correct "
+                                  "number parameters are set and accounts are "
+                                  "created, or retry with smaller tx rate.";
+        mLoadgenFail.Mark();
+        reset();
+        return;
+    }
+
     if (!mLoadTimer)
     {
         mLoadTimer = std::make_unique<VirtualTimer>(mApp.getClock());
@@ -161,15 +136,12 @@ LoadGenerator::scheduleLoadGeneration(bool isCreate, uint32_t nAccounts,
     if (mApp.getState() == Application::APP_SYNCED_STATE)
     {
         mLoadTimer->expires_from_now(std::chrono::milliseconds(STEP_MSECS));
-        mLoadTimer->async_wait([this, nAccounts, offset, nTxs, txRate,
-                                batchSize, isCreate,
-                                autoRate](asio::error_code const& error) {
-            if (!error)
-            {
+        mLoadTimer->async_wait(
+            [this, nAccounts, offset, nTxs, txRate, batchSize, isCreate]() {
                 this->generateLoad(isCreate, nAccounts, offset, nTxs, txRate,
-                                   batchSize, autoRate);
-            }
-        });
+                                   batchSize);
+            },
+            &VirtualTimer::onFailureNoop);
     }
     else
     {
@@ -177,15 +149,12 @@ LoadGenerator::scheduleLoadGeneration(bool isCreate, uint32_t nAccounts,
             << "Application is not in sync, load generation inhibited. State "
             << mApp.getState();
         mLoadTimer->expires_from_now(std::chrono::seconds(10));
-        mLoadTimer->async_wait([this, nAccounts, offset, nTxs, txRate,
-                                batchSize, isCreate,
-                                autoRate](asio::error_code const& error) {
-            if (!error)
-            {
+        mLoadTimer->async_wait(
+            [this, nAccounts, offset, nTxs, txRate, batchSize, isCreate]() {
                 this->scheduleLoadGeneration(isCreate, nAccounts, offset, nTxs,
-                                             txRate, batchSize, autoRate);
-            }
-        });
+                                             txRate, batchSize);
+            },
+            &VirtualTimer::onFailureNoop);
     }
 }
 
@@ -195,18 +164,21 @@ LoadGenerator::scheduleLoadGeneration(bool isCreate, uint32_t nAccounts,
 // with the remainder.
 void
 LoadGenerator::generateLoad(bool isCreate, uint32_t nAccounts, uint32_t offset,
-                            uint32_t nTxs, uint32_t txRate, uint32_t batchSize,
-                            bool autoRate)
+                            uint32_t nTxs, uint32_t txRate, uint32_t batchSize)
 {
-    soci::transaction sqltx(mApp.getDatabase().getSession());
-    mApp.getDatabase().setCurrentTransactionReadOnly();
+    if (!mStartTime)
+    {
+        mStartTime =
+            std::make_unique<VirtualClock::time_point>(mApp.getClock().now());
+    }
+
     createRootAccount();
 
     // Finish if no more txs need to be created.
     if ((isCreate && nAccounts == 0) || (!isCreate && nTxs == 0))
     {
         // Done submitting the load, now ensure it propagates to the DB.
-        waitTillComplete();
+        waitTillComplete(isCreate);
         return;
     }
 
@@ -220,14 +192,14 @@ LoadGenerator::generateLoad(bool isCreate, uint32_t nAccounts, uint32_t offset,
         batchSize = 1;
     }
 
-    uint32_t txPerStep = getTxPerStep(txRate);
+    auto txPerStep = getTxPerStep(txRate);
     auto& submitTimer =
         mApp.getMetrics().NewTimer({"loadgen", "step", "submit"});
     auto submitScope = submitTimer.TimeScope();
 
-    uint32_t ledgerNum = mApp.getLedgerManager().getLedgerNum();
+    uint32_t ledgerNum = mApp.getLedgerManager().getLastClosedLedgerNum() + 1;
 
-    for (uint32_t i = 0; i < txPerStep; ++i)
+    for (int64_t i = 0; i < txPerStep; ++i)
     {
         if (isCreate)
         {
@@ -251,22 +223,17 @@ LoadGenerator::generateLoad(bool isCreate, uint32_t nAccounts, uint32_t offset,
 
     uint64_t now =
         static_cast<uint64_t>(VirtualClock::to_time_t(mApp.getClock().now()));
-    bool secondBoundary = now != mLastSecond;
-
-    if (autoRate && secondBoundary)
-    {
-        mLastSecond = now;
-        inspectRate(ledgerNum, txRate);
-    }
 
     // Emit a log message once per second.
-    if (secondBoundary)
+    if (now != mLastSecond)
     {
         logProgress(submit, isCreate, nAccounts, nTxs, batchSize, txRate);
     }
 
-    scheduleLoadGeneration(isCreate, nAccounts, offset, nTxs, txRate, batchSize,
-                           autoRate);
+    mLastSecond = now;
+    mTotalSubmitted += txPerStep;
+    scheduleLoadGeneration(isCreate, nAccounts, offset, nTxs, txRate,
+                           batchSize);
 }
 
 uint32_t
@@ -277,25 +244,30 @@ LoadGenerator::submitCreationTx(uint32_t nAccounts, uint32_t offset,
     TxInfo tx =
         creationTransaction(mAccounts.size() + offset, numToProcess, ledgerNum);
     TransactionResultCode code;
-    Herder::TransactionSubmitStatus status;
+    TransactionQueue::AddResult status;
     bool createDuplicate = false;
     int numTries = 0;
 
     while ((status = tx.execute(mApp, true, code, batchSize)) !=
-           Herder::TX_STATUS_PENDING)
+           TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
-        handleFailedSubmission(tx.mFrom, status, code); // Update seq num
-        if (status == Herder::TX_STATUS_DUPLICATE)
+        // Ignore duplicate transactions, simply continue generating load
+        if (status == TransactionQueue::AddResult::ADD_STATUS_DUPLICATE)
         {
             createDuplicate = true;
             break;
         }
-        if (++numTries >= TX_SUBMIT_MAX_TRIES)
+
+        if (++numTries >= TX_SUBMIT_MAX_TRIES ||
+            status != TransactionQueue::AddResult::ADD_STATUS_ERROR)
         {
-            CLOG(ERROR, "LoadGen") << "Error creating account!";
-            clear();
+            // Failed to submit the step of load
+            mFailed = true;
             return 0;
         }
+
+        // In case of bad seqnum, attempt refreshing it from the DB
+        maybeHandleFailedTx(tx.mFrom, status, code);
     }
 
     if (!createDuplicate)
@@ -316,94 +288,28 @@ LoadGenerator::submitPaymentTx(uint32_t nAccounts, uint32_t offset,
         paymentTransaction(nAccounts, offset, ledgerNum, sourceAccountId);
 
     TransactionResultCode code;
-    Herder::TransactionSubmitStatus status;
+    TransactionQueue::AddResult status;
     int numTries = 0;
 
     while ((status = tx.execute(mApp, false, code, batchSize)) !=
-           Herder::TX_STATUS_PENDING)
+           TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
-        handleFailedSubmission(tx.mFrom, status, code); // Update seq num
-        tx = paymentTransaction(nAccounts, offset, ledgerNum,
-                                sourceAccountId); // re-generate the tx
-        if (++numTries >= TX_SUBMIT_MAX_TRIES)
+        if (++numTries >= TX_SUBMIT_MAX_TRIES ||
+            status != TransactionQueue::AddResult::ADD_STATUS_ERROR)
         {
-            CLOG(ERROR, "LoadGen") << "Error submitting tx: did you specify "
-                                      "correct number of accounts and offset?";
-            clear();
+            mFailed = true;
             return 0;
         }
+
+        // In case of bad seqnum, attempt refreshing it from the DB
+        maybeHandleFailedTx(tx.mFrom, status, code); // Update seq num
+
+        // Regenerate a new payment tx
+        tx = paymentTransaction(nAccounts, offset, ledgerNum, sourceAccountId);
     }
 
     nTxs -= 1;
     return nTxs;
-}
-
-void
-LoadGenerator::inspectRate(uint32_t ledgerNum, uint32_t& txRate)
-{
-    // Automatic tx rate calculation involves taking the temperature
-    // of the program and deciding if there's "room" to increase the
-    // tx apply rate.
-    auto& m = mApp.getMetrics();
-    auto& ledgerCloseTimer = m.NewTimer({"ledger", "ledger", "close"});
-    auto& ledgerAgeClosedTimer = m.NewTimer({"ledger", "age", "closed"});
-
-    if (ledgerNum > 10 && ledgerCloseTimer.count() > 5)
-    {
-        // We consider the system "well loaded" at the point where its
-        // ledger-close timer has avg duration within 10% of 2.5s
-        // (or, well, "half the ledger-age target" which is 5s by
-        // default).
-        //
-        // This is a bit arbitrary but it seems sufficient to
-        // empirically differentiate "totally easy" from "starting to
-        // struggle"; the system still has half the ledger-period to
-        // digest incoming txs and acquire consensus. If it's over this
-        // point, we reduce load; if it's under this point, we increase
-        // load.
-        //
-        // We also decrease load (but don't increase it) based on ledger
-        // age itself, directly: if the age gets above the herder's
-        // timer target, we shed load accordingly because the *network*
-        // (or some other component) is not reaching consensus fast
-        // enough, independent of database close-speed.
-
-        double targetAge =
-            (double)mApp.getConfig().getExpectedLedgerCloseTime().count() *
-            1000.0;
-        double actualAge = ledgerAgeClosedTimer.mean();
-
-        if (mApp.getConfig().ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING)
-        {
-            targetAge = 1.0;
-        }
-
-        double targetLatency = targetAge / 2.0;
-        double actualLatency = ledgerCloseTimer.mean();
-
-        CLOG(INFO, "LoadGen")
-            << "Considering auto-tx adjustment, avg close time "
-            << ((uint32_t)actualLatency) << "ms, avg ledger age "
-            << ((uint32_t)actualAge) << "ms";
-
-        if (!maybeAdjustRate(targetAge, actualAge, txRate, false))
-        {
-            maybeAdjustRate(targetLatency, actualLatency, txRate, true);
-        }
-
-        if (txRate > 5000)
-        {
-            CLOG(WARNING, "LoadGen")
-                << "TxRate > 5000, likely metric stutter, resetting";
-            txRate = 10;
-        }
-
-        // Unfortunately the timer reservoir size is 1028 by default and
-        // we cannot adjust it here, so in order to adapt to load
-        // relatively quickly, we clear it out every 5 ledgers.
-        ledgerAgeClosedTimer.Clear();
-        ledgerCloseTimer.Clear();
-    }
 }
 
 void
@@ -415,7 +321,7 @@ LoadGenerator::logProgress(std::chrono::nanoseconds submitTimer, bool isCreate,
 
     auto& m = mApp.getMetrics();
     auto& applyTx = m.NewTimer({"ledger", "transaction", "apply"});
-    auto& applyOp = m.NewTimer({"transaction", "op", "apply"});
+    auto& applyOp = m.NewTimer({"ledger", "operation", "apply"});
 
     auto submitSteps = duration_cast<milliseconds>(submitTimer).count();
 
@@ -452,7 +358,7 @@ LoadGenerator::creationTransaction(uint64_t startAccount, uint64_t numItems,
 void
 LoadGenerator::updateMinBalance()
 {
-    auto b = mApp.getLedgerManager().getMinBalance(0);
+    auto b = mApp.getLedgerManager().getLastMinBalance(0);
     if (b > mMinBalance)
     {
         mMinBalance = b;
@@ -480,25 +386,24 @@ LoadGenerator::createAccounts(uint64_t start, uint64_t count,
 }
 
 bool
-LoadGenerator::loadAccount(TestAccount& account, Database& database)
+LoadGenerator::loadAccount(TestAccount& account, Application& app)
 {
-    AccountFrame::pointer ret;
-    ret = AccountFrame::loadAccount(account.getPublicKey(), database);
-    if (!ret)
+    LedgerTxn ltx(app.getLedgerTxnRoot());
+    auto entry = stellar::loadAccount(ltx, account.getPublicKey());
+    if (!entry)
     {
         return false;
     }
-    account.setSequenceNumber(ret->getSeqNum());
-
+    account.setSequenceNumber(entry.current().data.account().seqNum);
     return true;
 }
 
 bool
-LoadGenerator::loadAccount(TestAccountPtr acc, Database& database)
+LoadGenerator::loadAccount(TestAccountPtr acc, Application& app)
 {
     if (acc)
     {
-        return loadAccount(*acc, database);
+        return loadAccount(*acc, app);
     }
     return false;
 }
@@ -533,13 +438,13 @@ LoadGenerator::findAccount(uint64_t accountId, uint32_t ledgerNum)
     if (res == mAccounts.end())
     {
         SequenceNumber sn = static_cast<SequenceNumber>(ledgerNum) << 32;
-        auto name = "TestAccount-" + to_string(accountId);
-        auto account = TestAccount{mApp, txtest::getAccount(name.c_str()), sn};
-        newAccountPtr = make_shared<TestAccount>(account);
+        auto name = "TestAccount-" + std::to_string(accountId);
+        newAccountPtr =
+            std::make_shared<TestAccount>(mApp, txtest::getAccount(name), sn);
 
-        if (!loadAccount(newAccountPtr, mApp.getDatabase()))
+        if (!loadAccount(newAccountPtr, mApp))
         {
-            std::runtime_error(
+            throw std::runtime_error(
                 fmt::format("Account {0} must exist in the DB.", accountId));
         }
         mAccounts.insert(
@@ -569,15 +474,16 @@ LoadGenerator::paymentTransaction(uint32_t numAccounts, uint32_t offset,
 }
 
 void
-LoadGenerator::handleFailedSubmission(TestAccountPtr sourceAccount,
-                                      Herder::TransactionSubmitStatus status,
-                                      TransactionResultCode code)
+LoadGenerator::maybeHandleFailedTx(TestAccountPtr sourceAccount,
+                                   TransactionQueue::AddResult status,
+                                   TransactionResultCode code)
 {
     // Note that if transaction is a DUPLICATE, its sequence number is
     // incremented on the next call to execute.
-    if (status == Herder::TX_STATUS_ERROR && code == txBAD_SEQ)
+    if (status == TransactionQueue::AddResult::ADD_STATUS_ERROR &&
+        code == txBAD_SEQ)
     {
-        if (!loadAccount(sourceAccount, mApp.getDatabase()))
+        if (!loadAccount(sourceAccount, mApp))
         {
             CLOG(ERROR, "LoadGen")
                 << "Unable to reload account " << sourceAccount->getAccountId();
@@ -586,21 +492,43 @@ LoadGenerator::handleFailedSubmission(TestAccountPtr sourceAccount,
 }
 
 std::vector<LoadGenerator::TestAccountPtr>
-LoadGenerator::checkAccountSynced(Database& database)
+LoadGenerator::checkAccountSynced(Application& app, bool isCreate)
 {
     std::vector<TestAccountPtr> result;
     for (auto const& acc : mAccounts)
     {
         TestAccountPtr account = acc.second;
-        auto currentSeqNum = account->getLastSequenceNumber();
-        auto reloadRes = loadAccount(account, database);
-        // reload the account
-        if (!reloadRes || currentSeqNum != account->getLastSequenceNumber())
+        auto accountFromDB = *account;
+
+        auto reloadRes = loadAccount(accountFromDB, app);
+        // For account creation, reload accounts from the DB
+        // For payments, ensure that the sequence number matches expected
+        // seqnum. Timeout after 20 ledgers.
+        if (isCreate)
         {
-            CLOG(DEBUG, "LoadGen")
+            if (!reloadRes)
+            {
+                CLOG(TRACE, "LoadGen") << "Account " << account->getAccountId()
+                                       << " is not created yet!";
+                result.push_back(account);
+            }
+        }
+        else if (!reloadRes)
+        {
+            auto msg =
+                fmt::format("Account {} used to submit payment tx could not "
+                            "load, DB might be in a corrupted state",
+                            account->getAccountId());
+            throw std::runtime_error(msg);
+        }
+        else if (account->getLastSequenceNumber() !=
+                 accountFromDB.getLastSequenceNumber())
+        {
+            CLOG(TRACE, "LoadGen")
                 << "Account " << account->getAccountId()
-                << " is at sequence num " << currentSeqNum
-                << ", but the DB is at  " << account->getLastSequenceNumber();
+                << " is at sequence num " << account->getLastSequenceNumber()
+                << ", but the DB is at  "
+                << accountFromDB.getLastSequenceNumber();
             result.push_back(account);
         }
     }
@@ -608,34 +536,37 @@ LoadGenerator::checkAccountSynced(Database& database)
 }
 
 void
-LoadGenerator::waitTillComplete()
+LoadGenerator::waitTillComplete(bool isCreate)
 {
     if (!mLoadTimer)
     {
         mLoadTimer = std::make_unique<VirtualTimer>(mApp.getClock());
     }
     vector<TestAccountPtr> inconsistencies;
-    inconsistencies = checkAccountSynced(mApp.getDatabase());
+    inconsistencies = checkAccountSynced(mApp, isCreate);
 
     if (inconsistencies.empty())
     {
         CLOG(INFO, "LoadGen") << "Load generation complete.";
-        mApp.getMetrics()
-            .NewMeter({"loadgen", "run", "complete"}, "run")
-            .Mark();
-        clear();
+        mLoadgenComplete.Mark();
+        reset();
         return;
     }
     else
     {
+        if (++mWaitTillCompleteForLedgers >= TIMEOUT_NUM_LEDGERS)
+        {
+            CLOG(INFO, "LoadGen") << "Load generation failed.";
+            mLoadgenFail.Mark();
+            reset();
+            return;
+        }
+
         mLoadTimer->expires_from_now(
             mApp.getConfig().getExpectedLedgerCloseTime());
-        mLoadTimer->async_wait([this](asio::error_code const& error) {
-            if (!error)
-            {
-                this->waitTillComplete();
-            }
-        });
+        mLoadTimer->async_wait(
+            [this, isCreate]() { this->waitTillComplete(isCreate); },
+            &VirtualTimer::onFailureNoop);
     }
 }
 
@@ -645,7 +576,6 @@ LoadGenerator::waitTillComplete()
 
 LoadGenerator::TxMetrics::TxMetrics(medida::MetricsRegistry& m)
     : mAccountCreated(m.NewMeter({"loadgen", "account", "created"}, "account"))
-    , mPayment(m.NewMeter({"loadgen", "payment", "any"}, "payment"))
     , mNativePayment(m.NewMeter({"loadgen", "payment", "native"}, "payment"))
     , mTxnAttempted(m.NewMeter({"loadgen", "txn", "attempted"}, "txn"))
     , mTxnRejected(m.NewMeter({"loadgen", "txn", "rejected"}, "txn"))
@@ -660,7 +590,6 @@ LoadGenerator::TxMetrics::report()
                            << mTxnRejected.count() << " rj, "
                            << mTxnBytes.count() << " by, "
                            << mAccountCreated.count() << " ac ("
-                           << mPayment.count() << " pa ("
                            << mNativePayment.count() << " na, ";
 
     CLOG(DEBUG, "LoadGen") << "Rates/sec (1m EWMA): " << std::setprecision(3)
@@ -668,11 +597,10 @@ LoadGenerator::TxMetrics::report()
                            << mTxnRejected.one_minute_rate() << " rj, "
                            << mTxnBytes.one_minute_rate() << " by, "
                            << mAccountCreated.one_minute_rate() << " ac, "
-                           << mPayment.one_minute_rate() << " pa ("
                            << mNativePayment.one_minute_rate() << " na, ";
 }
 
-Herder::TransactionSubmitStatus
+TransactionQueue::AddResult
 LoadGenerator::TxInfo::execute(Application& app, bool isCreate,
                                TransactionResultCode& code, int32_t batchSize)
 {
@@ -693,7 +621,6 @@ LoadGenerator::TxInfo::execute(Application& app, bool isCreate,
     }
     else
     {
-        txm.mPayment.Mark();
         txm.mNativePayment.Mark();
     }
     txm.mTxnAttempted.Mark();
@@ -704,13 +631,13 @@ LoadGenerator::TxInfo::execute(Application& app, bool isCreate,
     txm.mTxnBytes.Mark(xdr::xdr_argpack_size(msg));
 
     auto status = app.getHerder().recvTransaction(txf);
-    if (status != Herder::TX_STATUS_PENDING)
+    if (status != TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
         CLOG(INFO, "LoadGen")
-            << "tx rejected '" << Herder::TX_STATUS_STRING[status]
+            << "tx rejected '" << TX_STATUS_STRING[static_cast<int>(status)]
             << "': " << xdr::xdr_to_string(txf->getEnvelope()) << " ===> "
             << xdr::xdr_to_string(txf->getResult());
-        if (status == Herder::TX_STATUS_ERROR)
+        if (status == TransactionQueue::AddResult::ADD_STATUS_ERROR)
         {
             code = txf->getResultCode();
         }

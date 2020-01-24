@@ -29,8 +29,10 @@ class HistoryManager;
 class ProcessManager;
 class CommandHandler;
 class Database;
+class LedgerTxn;
+class LedgerTxnRoot;
+class InMemoryLedgerTxnRoot;
 class LoadGenerator;
-class NtpSynchronizationChecker;
 
 class ApplicationImpl : public Application
 {
@@ -38,7 +40,7 @@ class ApplicationImpl : public Application
     ApplicationImpl(VirtualClock& clock, Config const& cfg);
     virtual ~ApplicationImpl() override;
 
-    virtual void initialize() override;
+    virtual void initialize(bool newDB) override;
 
     virtual uint64_t timeNow() override;
 
@@ -67,35 +69,40 @@ class ApplicationImpl : public Application
     virtual Database& getDatabase() const override;
     virtual PersistentState& getPersistentState() override;
     virtual CommandHandler& getCommandHandler() override;
-    virtual WorkManager& getWorkManager() override;
+    virtual WorkScheduler& getWorkScheduler() override;
     virtual BanManager& getBanManager() override;
     virtual StatusManager& getStatusManager() override;
 
-    virtual asio::io_service& getWorkerIOService() override;
+    virtual asio::io_context& getWorkerIOContext() override;
+    virtual void postOnMainThread(std::function<void()>&& f,
+                                  std::string jobName) override;
+    virtual void postOnMainThreadWithDelay(std::function<void()>&& f,
+                                           std::string jobName) override;
+    virtual void postOnBackgroundThread(std::function<void()>&& f,
+                                        std::string jobName) override;
 
-    void newDB() override;
     virtual void start() override;
 
-    // Stops the worker io_service, which should cause the threads to exit once
+    // Stops the worker io_context, which should cause the threads to exit once
     // they finish running any work-in-progress. If you want a more abrupt exit
     // than this, call exit() and hope for the best.
     virtual void gracefulStop() override;
 
     // Wait-on and join all the threads this application started; should only
     // return when there is no more work to do or someone has force-stopped the
-    // worker io_service. Application can be safely destroyed after this
+    // worker io_context. Application can be safely destroyed after this
     // returns.
     virtual void joinAllThreads() override;
 
     virtual bool manualClose() override;
 
+#ifdef BUILD_TESTS
     virtual void generateLoad(bool isCreate, uint32_t nAccounts,
                               uint32_t offset, uint32_t nTxs, uint32_t txRate,
-                              uint32_t batchSize, bool autoRate) override;
+                              uint32_t batchSize) override;
 
     virtual LoadGenerator& getLoadGenerator() override;
-
-    virtual void checkDB() override;
+#endif
 
     virtual void applyCfgCommands() override;
 
@@ -107,6 +114,8 @@ class ApplicationImpl : public Application
 
     virtual Hash const& getNetworkID() const override;
 
+    virtual AbstractLedgerTxnParent& getLedgerTxnRoot() override;
+
   protected:
     std::unique_ptr<LedgerManager>
         mLedgerManager;              // allow to change that for tests
@@ -116,7 +125,7 @@ class ApplicationImpl : public Application
     VirtualClock& mVirtualClock;
     Config mConfig;
 
-    // NB: The io_service should come first, then the 'manager' sub-objects,
+    // NB: The io_context should come first, then the 'manager' sub-objects,
     // then the threads. Do not reorder these fields.
     //
     // The fields must be constructed in this order, because the subsystem
@@ -127,11 +136,10 @@ class ApplicationImpl : public Application
     // threads must be joined and destroyed before we start tearing down
     // subsystems.
 
-    asio::io_service mWorkerIOService;
-    std::unique_ptr<asio::io_service::work> mWork;
+    asio::io_context mWorkerIOContext;
+    std::unique_ptr<asio::io_context::work> mWork;
 
     std::unique_ptr<Database> mDatabase;
-    std::unique_ptr<TmpDirManager> mTmpDirManager;
     std::unique_ptr<OverlayManager> mOverlayManager;
     std::unique_ptr<BucketManager> mBucketManager;
     std::unique_ptr<CatchupManager> mCatchupManager;
@@ -142,36 +150,58 @@ class ApplicationImpl : public Application
     std::unique_ptr<Maintainer> mMaintainer;
     std::shared_ptr<ProcessManager> mProcessManager;
     std::unique_ptr<CommandHandler> mCommandHandler;
-    std::shared_ptr<WorkManager> mWorkManager;
+    std::shared_ptr<WorkScheduler> mWorkScheduler;
     std::unique_ptr<PersistentState> mPersistentState;
-    std::unique_ptr<LoadGenerator> mLoadGenerator;
     std::unique_ptr<BanManager> mBanManager;
-    std::shared_ptr<NtpSynchronizationChecker> mNtpSynchronizationChecker;
     std::unique_ptr<StatusManager> mStatusManager;
+    std::unique_ptr<AbstractLedgerTxnParent> mLedgerTxnRoot;
+
+    // This exists for use in MODE_USES_IN_MEMORY_LEDGER only: the
+    // mLedgerTxnRoot will be an InMemoryLedgerTxnRoot which is a _stub_
+    // AbstractLedgerTxnParent that refuses all commits and answers null to all
+    // queries; then an inner "never-committing" sub-LedgerTxn is constructed
+    // beneath it that serves as the "effective" in-memory root transaction,
+    // is returned when a client requests the root.
+    //
+    // Note that using this only works when the ledger can fit in RAM -- as it
+    // is held in the never-committing LedgerTxn in its entirety -- so if it
+    // ever grows beyond RAM-size you need to use a mode with some sort of
+    // database on secondary storage.
+    std::unique_ptr<LedgerTxn> mNeverCommittingLedgerTxn;
+
+#ifdef BUILD_TESTS
+    std::unique_ptr<LoadGenerator> mLoadGenerator;
+#endif
 
     std::vector<std::thread> mWorkerThreads;
 
     asio::signal_set mStopSignals;
 
+    bool mStarted;
     bool mStopping;
 
     VirtualTimer mStoppingTimer;
 
     std::unique_ptr<medida::MetricsRegistry> mMetrics;
     medida::Counter& mAppStateCurrent;
-    medida::Timer& mAppStateChanges;
-    VirtualClock::time_point mLastStateChange;
+    medida::Timer& mPostOnMainThreadDelay;
+    medida::Timer& mPostOnMainThreadWithDelayDelay;
+    medida::Timer& mPostOnBackgroundThreadDelay;
     VirtualClock::time_point mStartedOn;
 
     Hash mNetworkID;
 
-    void shutdownMainIOService();
-    void runWorkerThread(unsigned i);
+    void newDB();
+    void upgradeDB();
+
+    void shutdownMainIOContext();
+    void shutdownWorkScheduler();
 
     void enableInvariantsFromConfig();
 
     virtual std::unique_ptr<Herder> createHerder();
     virtual std::unique_ptr<InvariantManager> createInvariantManager();
     virtual std::unique_ptr<OverlayManager> createOverlayManager();
+    virtual std::unique_ptr<LedgerManager> createLedgerManager();
 };
 }

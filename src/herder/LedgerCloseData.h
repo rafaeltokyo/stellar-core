@@ -5,6 +5,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "TxSetFrame.h"
+#include "main/Config.h"
 #include "overlay/StellarXDR.h"
 #include <string>
 
@@ -21,7 +22,8 @@ namespace stellar
 class LedgerCloseData
 {
   public:
-    LedgerCloseData(uint32_t ledgerSeq, TxSetFramePtr txSet,
+    LedgerCloseData(uint32_t ledgerSeq,
+                    std::shared_ptr<AbstractTxSetFrameForApply> txSet,
                     StellarValue const& v);
 
     uint32_t
@@ -29,7 +31,7 @@ class LedgerCloseData
     {
         return mLedgerSeq;
     }
-    TxSetFramePtr
+    std::shared_ptr<AbstractTxSetFrameForApply>
     getTxSet() const
     {
         return mTxSet;
@@ -42,11 +44,11 @@ class LedgerCloseData
 
   private:
     uint32_t mLedgerSeq;
-    TxSetFramePtr mTxSet;
+    std::shared_ptr<AbstractTxSetFrameForApply> mTxSet;
     StellarValue mValue;
 };
 
-std::string stellarValueToString(StellarValue const& sv);
+std::string stellarValueToString(Config const& c, StellarValue const& sv);
 
 #define emptyUpgradeSteps (xdr::xvector<UpgradeType, 6>(0))
 }

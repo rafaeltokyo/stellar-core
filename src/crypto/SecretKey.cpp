@@ -10,11 +10,16 @@
 #include "main/Config.h"
 #include "transactions/SignatureUtils.h"
 #include "util/HashOfHash.h"
-#include "util/lrucache.hpp"
+#include "util/Math.h"
+#include "util/RandomEvictionCache.h"
 #include <memory>
 #include <mutex>
 #include <sodium.h>
 #include <type_traits>
+
+#ifdef MSAN_ENABLED
+#include <sanitizer/msan_interface.h>
+#endif
 
 namespace stellar
 {
@@ -27,7 +32,7 @@ namespace stellar
 // has no effect on correctness.
 
 static std::mutex gVerifySigCacheMutex;
-static cache::lru_cache<Hash, bool> gVerifySigCache(0xffff);
+static RandomEvictionCache<Hash, bool> gVerifySigCache(0xffff);
 static std::unique_ptr<SHA256> gHasher = SHA256::create();
 static uint64_t gVerifyCacheHit = 0;
 static uint64_t gVerifyCacheMiss = 0;
@@ -139,9 +144,43 @@ SecretKey::random()
     {
         throw std::runtime_error("error generating random secret key");
     }
-
+#ifdef MSAN_ENABLED
+    __msan_unpoison(out.key.data(), out.key.size());
+#endif
     return sk;
 }
+
+#ifdef BUILD_TESTS
+static SecretKey
+pseudoRandomForTestingFromPRNG(std::default_random_engine& engine)
+{
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < crypto_sign_SEEDBYTES; ++i)
+    {
+        bytes.push_back(static_cast<uint8_t>(engine()));
+    }
+    return SecretKey::fromSeed(bytes);
+}
+
+SecretKey
+SecretKey::pseudoRandomForTesting()
+{
+    // Reminder: this is not cryptographic randomness or even particularly hard
+    // to guess PRNG-ness. It's intended for _deterministic_ use, when you want
+    // "slightly random-ish" keys, for test-data generation.
+    return pseudoRandomForTestingFromPRNG(gRandomEngine);
+}
+
+SecretKey
+SecretKey::pseudoRandomForTestingFromSeed(unsigned int seed)
+{
+    // Reminder: this is not cryptographic randomness or even particularly hard
+    // to guess PRNG-ness. It's intended for _deterministic_ use, when you want
+    // "slightly random-ish" keys, for test-data generation.
+    std::default_random_engine tmpEngine(seed);
+    return pseudoRandomForTestingFromPRNG(tmpEngine);
+}
+#endif
 
 SecretKey
 SecretKey::fromSeed(ByteSlice const& seed)
@@ -249,7 +288,7 @@ KeyFunctions<PublicKey>::getKeyValue(PublicKey& key)
 {
     switch (key.type())
     {
-    case SIGNER_KEY_TYPE_ED25519:
+    case PUBLIC_KEY_TYPE_ED25519:
         return key.ed25519();
     default:
         throw std::invalid_argument("invalid public key type");
@@ -261,7 +300,7 @@ KeyFunctions<PublicKey>::getKeyValue(PublicKey const& key)
 {
     switch (key.type())
     {
-    case SIGNER_KEY_TYPE_ED25519:
+    case PUBLIC_KEY_TYPE_ED25519:
         return key.ed25519();
     default:
         throw std::invalid_argument("invalid public key type");

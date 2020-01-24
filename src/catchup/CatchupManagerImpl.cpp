@@ -16,7 +16,7 @@
 #include "util/Logging.h"
 #include "util/StatusManager.h"
 #include "util/format.h"
-#include "work/WorkManager.h"
+#include "work/WorkScheduler.h"
 
 namespace stellar
 {
@@ -28,14 +28,7 @@ CatchupManager::create(Application& app)
 }
 
 CatchupManagerImpl::CatchupManagerImpl(Application& app)
-    : mApp(app)
-    , mCatchupWork(nullptr)
-    , mCatchupStart(
-          app.getMetrics().NewMeter({"history", "catchup", "start"}, "event"))
-    , mCatchupSuccess(
-          app.getMetrics().NewMeter({"history", "catchup", "success"}, "event"))
-    , mCatchupFailure(
-          app.getMetrics().NewMeter({"history", "catchup", "failure"}, "event"))
+    : mApp(app), mCatchupWork(nullptr)
 {
 }
 
@@ -51,7 +44,7 @@ CatchupManagerImpl::historyCaughtup()
 
 void
 CatchupManagerImpl::catchupHistory(CatchupConfiguration catchupConfiguration,
-                                   bool manualCatchup,
+                                   std::shared_ptr<HistoryArchive> archive,
                                    CatchupWork::ProgressHandler handler)
 {
     if (mCatchupWork)
@@ -59,35 +52,14 @@ CatchupManagerImpl::catchupHistory(CatchupConfiguration catchupConfiguration,
         throw std::runtime_error("Catchup already in progress");
     }
 
-    mCatchupStart.Mark();
-
-    mCatchupWork = mApp.getWorkManager().addWork<CatchupWork>(
-        catchupConfiguration, manualCatchup, handler, Work::RETRY_NEVER);
-    mApp.getWorkManager().advanceChildren();
+    mCatchupWork = mApp.getWorkScheduler().scheduleWork<CatchupWork>(
+        catchupConfiguration, handler, archive);
 }
 
 std::string
 CatchupManagerImpl::getStatus() const
 {
     return mCatchupWork ? mCatchupWork->getStatus() : std::string{};
-}
-
-uint64_t
-CatchupManagerImpl::getCatchupStartCount() const
-{
-    return mCatchupStart.count();
-}
-
-uint64_t
-CatchupManagerImpl::getCatchupSuccessCount() const
-{
-    return mCatchupSuccess.count();
-}
-
-uint64_t
-CatchupManagerImpl::getCatchupFailureCount() const
-{
-    return mCatchupFailure.count();
 }
 
 void

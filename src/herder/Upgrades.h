@@ -14,16 +14,19 @@
 
 namespace stellar
 {
+class AbstractLedgerTxn;
 class Config;
 class Database;
-class LedgerDelta;
-class LedgerManager;
 struct LedgerHeader;
 struct LedgerUpgrade;
 
 class Upgrades
 {
   public:
+    // # of hours after the scheduled upgrade time before we remove pending
+    // upgrades
+    static std::chrono::hours const UPDGRADE_EXPIRATION_HOURS;
+
     struct UpgradeParameters
     {
         UpgradeParameters()
@@ -36,7 +39,7 @@ class Upgrades
                 make_optional<uint32>(cfg.LEDGER_PROTOCOL_VERSION);
             mBaseFee = make_optional<uint32>(cfg.TESTING_UPGRADE_DESIRED_FEE);
             mMaxTxSize =
-                make_optional<uint32>(cfg.TESTING_UPGRADE_MAX_TX_PER_LEDGER);
+                make_optional<uint32>(cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE);
             mBaseReserve = make_optional<uint32>(cfg.TESTING_UPGRADE_RESERVE);
         }
         VirtualClock::time_point mUpgradeTime;
@@ -63,11 +66,27 @@ class Upgrades
     createUpgradesFor(LedgerHeader const& header) const;
 
     // apply upgrade to ledger header
-    static void applyTo(LedgerUpgrade const& upgrade,
-                        LedgerManager& ledgerManager, LedgerDelta& ld);
+    static void applyTo(LedgerUpgrade const& upgrade, AbstractLedgerTxn& ltx);
 
     // convert upgrade value to string
     static std::string toString(LedgerUpgrade const& upgrade);
+
+    enum class UpgradeValidity
+    {
+        VALID,
+        XDR_INVALID,
+        INVALID
+    };
+
+    // VALID if it is safe to apply upgrade
+    // XDR_INVALID if the upgrade cannot be deserialized
+    // INVALID if it is unsafe to apply the upgrade for any other reason
+    //
+    // If the upgrade could be deserialized then lupgrade is set
+    static UpgradeValidity isValidForApply(UpgradeType const& upgrade,
+                                           LedgerUpgrade& lupgrade,
+                                           LedgerHeader const& header,
+                                           uint32_t maxLedgerVersion);
 
     // returns true if upgrade is a valid upgrade step
     // in which case it also sets upgradeType
@@ -83,11 +102,11 @@ class Upgrades
     UpgradeParameters
     removeUpgrades(std::vector<UpgradeType>::const_iterator beginUpdates,
                    std::vector<UpgradeType>::const_iterator endUpdates,
-                   bool& updated);
+                   uint64_t time, bool& updated);
 
     static void dropAll(Database& db);
 
-    static void storeUpgradeHistory(LedgerManager& ledgerManager,
+    static void storeUpgradeHistory(Database& db, uint32_t ledgerSeq,
                                     LedgerUpgrade const& upgrade,
                                     LedgerEntryChanges const& changes,
                                     int index);
@@ -99,10 +118,15 @@ class Upgrades
 
     bool timeForUpgrade(uint64_t time) const;
 
-    static void applyVersionUpgrade(LedgerManager& lm, LedgerDelta& ld,
+    // returns true if upgrade is a valid upgrade step
+    // in which case it also sets lupgrade
+    bool isValidForNomination(LedgerUpgrade const& upgrade,
+                              LedgerHeader const& header) const;
+
+    static void applyVersionUpgrade(AbstractLedgerTxn& ltx,
                                     uint32_t newVersion);
 
-    static void applyReserveUpgrade(LedgerManager& lm, LedgerDelta& ld,
+    static void applyReserveUpgrade(AbstractLedgerTxn& ltx,
                                     uint32_t newReserve);
 };
 }

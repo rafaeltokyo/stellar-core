@@ -8,8 +8,9 @@
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "overlay/OverlayManager.h"
-#include "overlay/PeerRecord.h"
+#include "overlay/PeerManager.h"
 #include "scp/LocalNode.h"
+#include "test/TestUtils.h"
 #include "test/test.h"
 #include "util/Logging.h"
 #include "util/Math.h"
@@ -47,20 +48,23 @@ Simulation::~Simulation()
     // destroy all nodes first
     mNodes.clear();
 
+    // kill scheduler before the io service
+    testutil::shutdownWorkScheduler(*mIdleApp);
+
     // tear down main app/clock
-    mClock.getIOService().poll_one();
-    mClock.getIOService().stop();
+    mClock.getIOContext().poll_one();
+    mClock.getIOContext().stop();
     while (mClock.cancelAllEvents())
         ;
 }
 
 void
-Simulation::setCurrentTime(VirtualClock::time_point t)
+Simulation::setCurrentVirtualTime(VirtualClock::time_point t)
 {
-    mClock.setCurrentTime(t);
+    mClock.setCurrentVirtualTime(t);
     for (auto& p : mNodes)
     {
-        p.second.mClock->setCurrentTime(t);
+        p.second.mClock->setCurrentVirtualTime(t);
     }
 }
 
@@ -70,6 +74,7 @@ Simulation::addNode(SecretKey nodeKey, SCPQuorumSet qSet, Config const* cfg2,
 {
     auto cfg = cfg2 ? std::make_shared<Config>(*cfg2)
                     : std::make_shared<Config>(newConfig());
+    cfg->adjust();
     cfg->NODE_SEED = nodeKey;
 
     if (mQuorumSetAdjuster)
@@ -88,7 +93,7 @@ Simulation::addNode(SecretKey nodeKey, SCPQuorumSet qSet, Config const* cfg2,
                                                     : VirtualClock::REAL_TIME);
     if (mVirtualClockMode)
     {
-        clock->setCurrentTime(mClock.now());
+        clock->setCurrentVirtualTime(mClock.now());
     }
 
     auto app = Application::create(*clock, *cfg, newDB);
@@ -189,7 +194,8 @@ Simulation::dropConnection(NodeID initiator, NodeID acceptor)
                 PeerBareAddress{"127.0.0.1", cAcceptor.PEER_PORT});
             if (peer)
             {
-                peer->drop(true);
+                peer->drop("drop", Peer::DropDirection::WE_DROPPED_REMOTE,
+                           Peer::DropMode::IGNORE_WRITE_QUEUE);
             }
         }
     }
@@ -204,6 +210,26 @@ Simulation::addLoopbackConnection(NodeID initiator, NodeID acceptor)
             *getNode(initiator), *getNode(acceptor));
         mLoopbackConnections.push_back(conn);
     }
+}
+
+std::shared_ptr<LoopbackPeerConnection>
+Simulation::getLoopbackConnection(NodeID const& initiator,
+                                  NodeID const& acceptor)
+{
+    auto it = std::find_if(
+        std::begin(mLoopbackConnections), std::end(mLoopbackConnections),
+        [&](std::shared_ptr<LoopbackPeerConnection> const& conn) {
+            return conn->getInitiator()
+                           ->getApp()
+                           .getConfig()
+                           .NODE_SEED.getPublicKey() == initiator &&
+                   conn->getAcceptor()
+                           ->getApp()
+                           .getConfig()
+                           .NODE_SEED.getPublicKey() == acceptor;
+        });
+
+    return it == std::end(mLoopbackConnections) ? nullptr : *it;
 }
 
 void
@@ -250,8 +276,10 @@ Simulation::startAllNodes()
     for (auto const& it : mNodes)
     {
         auto app = it.second.mApp;
-        app->start();
-        app->getLoadGenerator().updateMinBalance();
+        if (app->getState() == Application::APP_CREATED_STATE)
+        {
+            app->start();
+        }
     }
 
     for (auto const& pair : mPendingConnections)
@@ -280,10 +308,15 @@ Simulation::crankNode(NodeID const& id, VirtualClock::time_point timeout)
     auto p = mNodes[id];
     auto clock = p.mClock;
     auto app = p.mApp;
+    if (app->getState() == Application::APP_CREATED_STATE)
+    {
+        throw std::runtime_error("Can't crank node that is not started");
+    }
+
     size_t quantumClicks = 0;
+    bool doneWithQuantum = false;
     VirtualTimer quantumTimer(*app);
 
-    bool doneWithQuantum = false;
     if (mVirtualClockMode)
     {
         // in virtual mode we give at most a timeslice
@@ -332,7 +365,7 @@ Simulation::crankAllNodes(int nbTicks)
         // work was performed
         // or we've triggered the next scheduled event
 
-        if (mClock.getIOService().stopped())
+        if (mClock.getIOContext().stopped())
         {
             return 0;
         }
@@ -344,12 +377,8 @@ Simulation::crankAllNodes(int nbTicks)
         {
             // in virtual mode we need to crank the main clock manually
             mainQuantumTimer.expires_from_now(quantum);
-            mainQuantumTimer.async_wait([&](asio::error_code ec) {
-                if (!ec)
-                {
-                    quantumClicks++;
-                }
-            });
+            mainQuantumTimer.async_wait([&]() { quantumClicks++; },
+                                        &VirtualTimer::onFailureNoop);
         }
 
         // now, run the clock on all nodes until their clock is caught up
@@ -364,7 +393,7 @@ Simulation::crankAllNodes(int nbTicks)
             for (auto& p : mNodes)
             {
                 auto clock = p.second.mClock;
-                if (clock->getIOService().stopped())
+                if (clock->getIOContext().stopped())
                 {
                     continue;
                 }
@@ -487,14 +516,6 @@ Simulation::crankForAtLeast(VirtualClock::duration seconds, bool finalCrank)
 }
 
 void
-Simulation::crankUntilSync(Application& app, VirtualClock::duration timeout,
-                           bool finalCrank)
-{
-    crankUntil([&]() { return this->accountsOutOfSyncWithDb(app).empty(); },
-               timeout, finalCrank);
-}
-
-void
 Simulation::crankUntil(function<bool()> const& predicate,
                        VirtualClock::duration timeout, bool finalCrank)
 {
@@ -573,32 +594,6 @@ Simulation::crankUntil(VirtualClock::time_point timePoint, bool finalCrank)
     {
         stopAllNodes();
     }
-}
-
-vector<LoadGenerator::TestAccountPtr>
-Simulation::accountsOutOfSyncWithDb(Application& mainApp)
-{
-    vector<LoadGenerator::TestAccountPtr> result;
-    int iApp = 0;
-
-    for (auto const& p : mNodes)
-    {
-        iApp++;
-        vector<LoadGenerator::TestAccountPtr> res;
-        auto app = p.second.mApp;
-        res = mainApp.getLoadGenerator().checkAccountSynced(app->getDatabase());
-        if (!res.empty())
-        {
-            LOG(DEBUG) << "On node " << iApp
-                       << " some accounts are not in sync.";
-        }
-        else
-        {
-            result.insert(result.end(), res.begin(), res.end());
-        }
-    }
-    LOG(INFO) << "Ledger has not yet caught up to the simulation.";
-    return result;
 }
 
 Config

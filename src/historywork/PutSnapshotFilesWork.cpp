@@ -4,95 +4,124 @@
 
 #include "historywork/PutSnapshotFilesWork.h"
 #include "bucket/BucketManager.h"
-#include "history/FileTransferInfo.h"
+#include "history/HistoryArchiveManager.h"
 #include "history/StateSnapshot.h"
 #include "historywork/GetHistoryArchiveStateWork.h"
 #include "historywork/GzipFileWork.h"
-#include "historywork/MakeRemoteDirWork.h"
+#include "historywork/PutFilesWork.h"
 #include "historywork/PutHistoryArchiveStateWork.h"
-#include "historywork/PutRemoteFileWork.h"
 #include "main/Application.h"
+#include "work/WorkSequence.h"
+#include <util/format.h>
 
 namespace stellar
 {
 
 PutSnapshotFilesWork::PutSnapshotFilesWork(
-    Application& app, WorkParent& parent,
-    std::shared_ptr<HistoryArchive> archive,
-    std::shared_ptr<StateSnapshot> snapshot)
-    : Work(app, parent, "put-snapshot-files-" + archive->getName())
-    , mArchive(archive)
+    Application& app, std::shared_ptr<StateSnapshot> snapshot)
+    : Work(app,
+           fmt::format("update-archives-{:08x}",
+                       snapshot->mLocalState.currentLedger),
+           // Each put-snapshot-sequence will retry correctly
+           BasicWork::RETRY_NEVER)
     , mSnapshot(snapshot)
 {
 }
 
-PutSnapshotFilesWork::~PutSnapshotFilesWork()
+BasicWork::State
+PutSnapshotFilesWork::doWork()
 {
-    clearChildren();
+    if (!mUploadSeqs.empty())
+    {
+        return WorkUtils::getWorkStatus(mUploadSeqs);
+    }
+
+    if (!mGzipFilesWorks.empty())
+    {
+        if (WorkUtils::getWorkStatus(mGzipFilesWorks) == State::WORK_SUCCESS)
+        {
+            // Step 3: ready to upload files to archives
+            for (auto const& getState : mGetStateWorks)
+            {
+                auto putSnapshotFiles = std::make_shared<PutFilesWork>(
+                    mApp, getState->getArchive(), mSnapshot,
+                    getState->getHistoryArchiveState());
+                auto putArchiveState =
+                    std::make_shared<PutHistoryArchiveStateWork>(
+                        mApp, mSnapshot->mLocalState, getState->getArchive());
+
+                std::vector<std::shared_ptr<BasicWork>> seq{putSnapshotFiles,
+                                                            putArchiveState};
+                mUploadSeqs.emplace_back(addWork<WorkSequence>(
+                    "upload-files-seq", seq, BasicWork::RETRY_NEVER));
+            }
+            return State::WORK_RUNNING;
+        }
+        else
+        {
+            return WorkUtils::getWorkStatus(mGzipFilesWorks);
+        }
+    }
+
+    if (!mGetStateWorks.empty())
+    {
+        std::list<std::shared_ptr<BasicWork>> works(mGetStateWorks.begin(),
+                                                    mGetStateWorks.end());
+        auto status = WorkUtils::getWorkStatus(works);
+        if (status == State::WORK_SUCCESS)
+        {
+            // Step 2: Gzip all unique files
+            for (auto const& f : getFilesToZip())
+            {
+                mGzipFilesWorks.emplace_back(addWork<GzipFileWork>(f, true));
+            }
+            return State::WORK_RUNNING;
+        }
+        else
+        {
+            return status;
+        }
+    }
+
+    // Step 1: Get all archive states
+    for (auto const& archive :
+         mApp.getHistoryArchiveManager().getWritableHistoryArchives())
+    {
+        mGetStateWorks.emplace_back(addWork<GetHistoryArchiveStateWork>(
+            0, archive, "publish", BasicWork::RETRY_A_FEW));
+    }
+
+    return State::WORK_RUNNING;
 }
 
 void
-PutSnapshotFilesWork::onReset()
+PutSnapshotFilesWork::doReset()
 {
-    clearChildren();
-
-    mGetHistoryArchiveStateWork.reset();
-    mPutFilesWork.reset();
-    mPutHistoryArchiveStateWork.reset();
+    mGetStateWorks.clear();
+    mGzipFilesWorks.clear();
+    mUploadSeqs.clear();
 }
 
-Work::State
-PutSnapshotFilesWork::onSuccess()
+std::unordered_set<std::string>
+PutSnapshotFilesWork::getFilesToZip()
 {
-    // Phase 1: fetch remote history archive state
-    if (!mGetHistoryArchiveStateWork)
+    // Sanity check: there are states for all archives
+    if (mGetStateWorks.size() !=
+        mApp.getHistoryArchiveManager().getWritableHistoryArchives().size())
     {
-        mGetHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(
-            "get-history-archive-state", mRemoteState, 0, mArchive);
-        return WORK_PENDING;
+        throw std::runtime_error("Corrupted GetHistoryArchiveStateWork");
     }
 
-    // Phase 2: put all requisite data files
-    if (!mPutFilesWork)
+    std::unordered_set<std::string> filesToZip{};
+    for (auto const& getState : mGetStateWorks)
     {
-        mPutFilesWork = addWork<Work>("put-files");
-
-        std::vector<std::shared_ptr<FileTransferInfo>> files = {
-            mSnapshot->mLedgerSnapFile, mSnapshot->mTransactionSnapFile,
-            mSnapshot->mTransactionResultSnapFile,
-            mSnapshot->mSCPHistorySnapFile};
-
-        std::vector<std::string> bucketsToSend =
-            mSnapshot->mLocalState.differingBuckets(mRemoteState);
-
-        for (auto const& hash : bucketsToSend)
+        for (auto const& f :
+             mSnapshot->differingHASFiles(getState->getHistoryArchiveState()))
         {
-            auto b = mApp.getBucketManager().getBucketByHash(hexToBin256(hash));
-            assert(b);
-            files.push_back(std::make_shared<FileTransferInfo>(*b));
+            filesToZip.insert(f->localPath_nogz());
         }
-        for (auto f : files)
-        {
-            if (f && fs::exists(f->localPath_nogz()))
-            {
-                auto put = mPutFilesWork->addWork<PutRemoteFileWork>(
-                    f->localPath_gz(), f->remoteName(), mArchive);
-                auto mkdir =
-                    put->addWork<MakeRemoteDirWork>(f->remoteDir(), mArchive);
-                mkdir->addWork<GzipFileWork>(f->localPath_nogz(), true);
-            }
-        }
-        return WORK_PENDING;
     }
 
-    // Phase 3: update remote history archive state
-    if (!mPutHistoryArchiveStateWork)
-    {
-        mPutHistoryArchiveStateWork = addWork<PutHistoryArchiveStateWork>(
-            mSnapshot->mLocalState, mArchive);
-        return WORK_PENDING;
-    }
-
-    return WORK_SUCCESS;
+    return filesToZip;
 }
 }

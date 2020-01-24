@@ -8,60 +8,68 @@
 #include "historywork/BatchDownloadWork.h"
 #include "historywork/GetHistoryArchiveStateWork.h"
 #include "main/Application.h"
+#include "main/ErrorMessages.h"
+#include "util/FileSystemException.h"
 #include "util/TmpDir.h"
 #include "util/XDRStream.h"
 
 namespace stellar
 {
 
-FetchRecentQsetsWork::FetchRecentQsetsWork(Application& app, WorkParent& parent,
-                                           InferredQuorum& inferredQuorum)
-    : Work(app, parent, "fetch-recent-qsets"), mInferredQuorum(inferredQuorum)
+FetchRecentQsetsWork::FetchRecentQsetsWork(Application& app,
+                                           InferredQuorum& inferredQuorum,
+                                           uint32_t ledgerNum)
+    : Work(app, "fetch-recent-qsets")
+    , mInferredQuorum(inferredQuorum)
+    , mLedgerNum(ledgerNum)
 {
-}
-
-FetchRecentQsetsWork::~FetchRecentQsetsWork()
-{
-    clearChildren();
 }
 
 void
-FetchRecentQsetsWork::onReset()
+FetchRecentQsetsWork::doReset()
 {
-    clearChildren();
+    mGetHistoryArchiveStateWork.reset();
     mDownloadSCPMessagesWork.reset();
-    mDownloadDir = std::make_unique<TmpDir>(
-        mApp.getTmpDirManager().tmpDir(getUniqueName()));
+    mDownloadDir =
+        std::make_unique<TmpDir>(mApp.getTmpDirManager().tmpDir(getName()));
 }
 
-Work::State
-FetchRecentQsetsWork::onSuccess()
+BasicWork::State
+FetchRecentQsetsWork::doWork()
 {
     // Phase 1: fetch remote history archive state
     if (!mGetHistoryArchiveStateWork)
     {
-        mGetHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(
-            "get-history-archive-state", mRemoteState, 0);
-        return WORK_PENDING;
+        mGetHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(0);
+        return State::WORK_RUNNING;
+    }
+    else if (mGetHistoryArchiveStateWork->getState() != State::WORK_SUCCESS)
+    {
+        return mGetHistoryArchiveStateWork->getState();
     }
 
-    // Phase 2: download some SCP messages; for now we just pull the past
-    // 100 checkpoints = 9 hours of history. A more sophisticated view
-    // would survey longer time periods at lower resolution.
+    // Phase 2: download some SCP messages; for now we just pull the past 100
+    // checkpoints = 9 hours of history, which should be enough to see a message
+    // about every active qset. A more sophisticated view would survey longer
+    // time periods at lower resolution.
     uint32_t numCheckpoints = 100;
     uint32_t step = mApp.getHistoryManager().getCheckpointFrequency();
     uint32_t window = numCheckpoints * step;
-    uint32_t lastSeq = mRemoteState.currentLedger;
+    uint32_t lastSeq = mLedgerNum;
     uint32_t firstSeq = lastSeq < window ? (step - 1) : (lastSeq - window);
 
     if (!mDownloadSCPMessagesWork)
     {
-        CLOG(INFO, "History") << "Downloading recent SCP messages: ["
+        CLOG(INFO, "History") << "Downloading historical SCP messages: ["
                               << firstSeq << ", " << lastSeq << "]";
         auto range = CheckpointRange{firstSeq, lastSeq, step};
         mDownloadSCPMessagesWork = addWork<BatchDownloadWork>(
             range, HISTORY_FILE_TYPE_SCP, *mDownloadDir);
-        return WORK_PENDING;
+        return State::WORK_RUNNING;
+    }
+    else if (mDownloadSCPMessagesWork->getState() != State::WORK_SUCCESS)
+    {
+        return mDownloadSCPMessagesWork->getState();
     }
 
     // Phase 3: extract the qsets.
@@ -70,14 +78,27 @@ FetchRecentQsetsWork::onSuccess()
         CLOG(INFO, "History") << "Scanning for QSets in checkpoint: " << i;
         XDRInputFileStream in;
         FileTransferInfo fi(*mDownloadDir, HISTORY_FILE_TYPE_SCP, i);
-        in.open(fi.localPath_nogz());
+        try
+        {
+            in.open(fi.localPath_nogz());
+        }
+        catch (FileSystemException&)
+        {
+            CLOG(ERROR, "History") << POSSIBLY_CORRUPTED_LOCAL_FS;
+            return State::WORK_FAILURE;
+        }
+
         SCPHistoryEntry tmp;
         while (in && in.readOne(tmp))
         {
+            if (tmp.v0().ledgerMessages.ledgerSeq > mLedgerNum)
+            {
+                break;
+            }
             mInferredQuorum.noteSCPHistory(tmp);
         }
     }
 
-    return WORK_SUCCESS;
+    return State::WORK_SUCCESS;
 }
 }

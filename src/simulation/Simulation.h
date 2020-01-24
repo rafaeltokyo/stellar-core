@@ -9,8 +9,8 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "medida/medida.h"
-#include "overlay/LoopbackPeer.h"
 #include "overlay/StellarXDR.h"
+#include "overlay/test/LoopbackPeer.h"
 #include "simulation/LoadGenerator.h"
 #include "test/TxTests.h"
 #include "util/Timer.h"
@@ -42,7 +42,7 @@ class Simulation
     ~Simulation();
 
     // updates all clocks in the simulation to the same time_point
-    void setCurrentTime(VirtualClock::time_point t);
+    void setCurrentVirtualTime(VirtualClock::time_point t);
 
     Application::pointer addNode(SecretKey nodeKey, SCPQuorumSet qSet,
                                  Config const* cfg = nullptr,
@@ -52,6 +52,9 @@ class Simulation
     std::vector<NodeID> getNodeIDs();
 
     void addPendingConnection(NodeID const& initiator, NodeID const& acceptor);
+    // Returns LoopbackPeerConnection given initiator, acceptor pair or nullptr
+    std::shared_ptr<LoopbackPeerConnection>
+    getLoopbackConnection(NodeID const& initiator, NodeID const& acceptor);
     void startAllNodes();
     void stopAllNodes();
     void removeNode(NodeID const& id);
@@ -64,13 +67,9 @@ class Simulation
     size_t crankAllNodes(int nbTicks = 1);
     void crankForAtMost(VirtualClock::duration seconds, bool finalCrank);
     void crankForAtLeast(VirtualClock::duration seconds, bool finalCrank);
-    void crankUntilSync(Application& app, VirtualClock::duration timeout,
-                        bool finalCrank);
     void crankUntil(std::function<bool()> const& fn,
                     VirtualClock::duration timeout, bool finalCrank);
     void crankUntil(VirtualClock::time_point timePoint, bool finalCrank);
-    std::vector<LoadGenerator::TestAccountPtr> accountsOutOfSyncWithDb(
-        Application& mainApp); // returns the accounts that don't match
     std::string metricsSummary(std::string domain = "");
 
     void addConnection(NodeID initiator, NodeID acceptor);

@@ -5,35 +5,69 @@
 #pragma once
 
 #include "catchup/CatchupConfiguration.h"
-#include "historywork/BucketDownloadWork.h"
+#include "catchup/VerifyLedgerChainWork.h"
+#include "history/HistoryArchive.h"
+#include "historywork/GetHistoryArchiveStateWork.h"
 #include "ledger/LedgerRange.h"
+#include "work/Work.h"
+#include "work/WorkSequence.h"
 
 namespace stellar
 {
 
-class LedgerRange;
-class CheckpointRange;
 class HistoryManager;
+class Bucket;
+class TmpDir;
+struct LedgerRange;
+struct CheckpointRange;
 
 // Range required to do a catchup.
 //
-// If second is true, this catchup requires downloading and applying buckets
-// for the first.first() and then downloading and applying transactions.
+// For initial catchup (after new-db) we have lastClosedLedger ==
+// LedgerManager.GENESIS_LEDGER_SEQ. In that case CatchupConfiguration::count()
+// and CatchupConfiguration::toLedger() are taken into consideration. Depending
+// on all of those values only one of "apply buckets" and "apply transactions"
+// can be executed, or both of them. The values are calculated in such a way
+// that transactions from at least count() ledgers are available in txhistory
+// table.
 //
-// If second is false, this catchup requires downloading and applying
-// transactions for whole range of ledgers.
+// If mApplyBuckets is true, this catchup requires downloading and applying
+// buckets for the getBucketApplyLedger() (which is equal to
+// mApplyLedgers.mFirst - 1).
 //
-// When (first.first() == first.last()) && second this is equivalent to old
-// CATCHUP_MIMIMAL.
+// Then all ledgers in range mApplyLedgers are downloaded and applied.
 //
-// For old CATCHUP_COMPLETE second is always false, as CATCHUP_COMPLETE only
-// applies transactions.
-//
-// For old CATCHUP_RECENT value of second depends on value of last closed
-// ledger - if CATCHUP_RECENT would go before it, it behaves exactly as
-// CATCHUP_COMPLETE. If not, second is true and miminal catchup will be done
-// first.
-using CatchupRange = std::pair<LedgerRange, bool>;
+struct CatchupRange final
+{
+    struct Ledgers
+    {
+        uint32_t const mFirst;
+        uint32_t const mCount;
+    };
+
+    Ledgers mLedgers;
+    bool const mApplyBuckets;
+
+    /**
+     * Preconditions:
+     * * lastClosedLedger > 0
+     * * configuration.toLedger() > lastClosedLedger
+     * * configuration.toLedger() != CatchupConfiguration::CURRENT
+     */
+    explicit CatchupRange(uint32_t lastClosedLedger,
+                          CatchupConfiguration const& configuration,
+                          HistoryManager const& historyManager);
+
+    bool
+    applyLedgers() const
+    {
+        return mLedgers.mCount > 0;
+    }
+
+    uint32_t getLast() const;
+    uint32_t getBucketApplyLedger() const;
+};
+using WorkSeqPtr = std::shared_ptr<WorkSequence>;
 
 // CatchupWork does all the neccessary work to perform any type of catchup.
 // It accepts CatchupConfiguration structure to know from which ledger to which
@@ -54,15 +88,36 @@ using CatchupRange = std::pair<LedgerRange, bool>;
 //
 // After that, catchup is done and node can replay buffered ledgers and take
 // part in consensus protocol.
-class CatchupWork : public BucketDownloadWork
+
+class CatchupWork : public Work
 {
+  protected:
+    HistoryArchiveState mLocalState;
+    std::unique_ptr<TmpDir> mDownloadDir;
+    std::map<std::string, std::shared_ptr<Bucket>> mBuckets;
+
+    void doReset() override;
+    BasicWork::State doWork() override;
+    void onFailureRaise() override;
+    void onSuccess() override;
+
   public:
     enum class ProgressState
     {
         APPLIED_BUCKETS,
         APPLIED_TRANSACTIONS,
-        FINISHED
+        FINISHED,
+        FAILED
     };
+
+    // Resume application when publish queue shrinks down to this many
+    // checkpoints
+    static uint32_t const PUBLISH_QUEUE_UNBLOCK_APPLICATION;
+
+    // Allow at most this many checkpoints in the publish queue while catching
+    // up. If the queue grows too big, ApplyCheckpointWork will wait until
+    // enough snapshots were published, and unblock itself.
+    static uint32_t const PUBLISH_QUEUE_MAX_SIZE;
 
     // ProgressHandler is called in different phases of catchup with following
     // values of ProgressState argument:
@@ -82,59 +137,45 @@ class CatchupWork : public BucketDownloadWork
     // In case of error this callback is called with non-zero ec parameter and
     // the rest of them does not matter.
     using ProgressHandler = std::function<void(
-        asio::error_code const& ec, ProgressState progressState,
-        LedgerHeaderHistoryEntry const& lastClosed)>;
+        ProgressState progressState, LedgerHeaderHistoryEntry const& lastClosed,
+        CatchupConfiguration::Mode catchupMode)>;
 
-  public:
-    /**
-     * Preconditions:
-     * * lastClosedLedger > 0
-     * * configuration.toLedger() >= lastClosedLedger
-     * * configuration.toLedger() != CatchupConfiguration::CURRENT
-     */
-    static CatchupRange
-    makeCatchupRange(uint32_t lastClosedLedger,
-                     CatchupConfiguration const& configuration,
-                     HistoryManager const& historyManager);
-
-    CatchupWork(Application& app, WorkParent& parent,
-                CatchupConfiguration catchupConfiguration, bool manualCatchup,
-                ProgressHandler progressHandler, size_t maxRetries);
+    CatchupWork(Application& app, CatchupConfiguration catchupConfiguration,
+                ProgressHandler progressHandler,
+                std::shared_ptr<HistoryArchive> archive = nullptr);
+    virtual ~CatchupWork();
     std::string getStatus() const override;
-    void onReset() override;
-    State onSuccess() override;
-    void onFailureRaise() override;
-
-    ~CatchupWork();
 
   private:
-    HistoryArchiveState mRemoteState;
-    HistoryArchiveState mApplyBucketsRemoteState;
-    uint32_t mLastClosedLedgerAtReset;
+    LedgerNumHashPair mLastClosedLedgerHashPair;
     CatchupConfiguration const mCatchupConfiguration;
-    bool const mManualCatchup;
-    std::shared_ptr<Work> mGetHistoryArchiveStateWork;
-    std::shared_ptr<Work> mDownloadLedgersWork;
-    std::shared_ptr<Work> mVerifyLedgersWork;
-    std::shared_ptr<Work> mGetBucketsHistoryArchiveStateWork;
-    std::shared_ptr<Work> mDownloadBucketsWork;
-    std::shared_ptr<Work> mApplyBucketsWork;
-    std::shared_ptr<Work> mDownloadTransactionsWork;
-    std::shared_ptr<Work> mApplyTransactionsWork;
-    LedgerHeaderHistoryEntry mFirstVerified;
-    LedgerHeaderHistoryEntry mLastVerified;
+    LedgerHeaderHistoryEntry mVerifiedLedgerRangeStart;
     LedgerHeaderHistoryEntry mLastApplied;
     ProgressHandler mProgressHandler;
-    bool mBucketsAppliedEmitted;
+    std::shared_ptr<HistoryArchive> mArchive;
+    bool mBucketsAppliedEmitted{false};
+    bool mTransactionsVerifyEmitted{false};
+
+    std::shared_ptr<GetHistoryArchiveStateWork> mGetHistoryArchiveStateWork;
+    std::shared_ptr<GetHistoryArchiveStateWork> mGetBucketStateWork;
+
+    WorkSeqPtr mDownloadVerifyLedgersSeq;
+    std::shared_ptr<VerifyLedgerChainWork> mVerifyLedgers;
+    std::shared_ptr<Work> mVerifyTxResults;
+    WorkSeqPtr mBucketVerifyApplySeq;
+    std::shared_ptr<Work> mTransactionsVerifyApplySeq;
+    std::shared_ptr<BasicWork> mApplyBufferedLedgersWork;
+    WorkSeqPtr mCatchupSeq;
 
     bool hasAnyLedgersToCatchupTo() const;
-    bool downloadLedgers(CheckpointRange const& range);
-    bool verifyLedgers(LedgerRange const& range);
     bool alreadyHaveBucketsHistoryArchiveState(uint32_t atCheckpoint) const;
-    bool downloadBucketsHistoryArchiveState(uint32_t atCheckpoint);
-    bool downloadBuckets();
-    bool applyBuckets();
-    bool downloadTransactions(CheckpointRange const& range);
-    bool applyTransactions(LedgerRange const& range);
+    void assertBucketState();
+
+    void downloadVerifyLedgerChain(CatchupRange const& catchupRange,
+                                   LedgerNumHashPair rangeEnd);
+    WorkSeqPtr downloadApplyBuckets();
+    void downloadApplyTransactions(CatchupRange const& catchupRange);
+    void downloadVerifyTxResults(CatchupRange const& catchupRange);
+    BasicWork::State runCatchupStep();
 };
 }

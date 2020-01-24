@@ -46,10 +46,11 @@
 namespace stellar
 {
 
+class LoadManager;
 class PeerAuth;
 class PeerBareAddress;
-class PeerRecord;
-class LoadManager;
+class PeerManager;
+class SurveyManager;
 
 class OverlayManager
 {
@@ -66,29 +67,42 @@ class OverlayManager
 
     // Send a given message to all peers, via the FloodGate. This is called by
     // Herder.
-    virtual void broadcastMessage(StellarMessage const& msg,
-                                  bool force = false) = 0;
+    virtual void broadcastMessage(StellarMessage const& msg, bool force = false,
+                                  uint32_t minOverlayVersion = 0) = 0;
 
     // Make a note in the FloodGate that a given peer has provided us with a
     // given broadcast message, so that it is inhibited from being resent to
     // that peer. This does _not_ cause the message to be broadcast anew; to do
     // that, call broadcastMessage, above.
-    virtual void recvFloodedMsg(StellarMessage const& msg,
+    // Returns true if this is a new message
+    virtual bool recvFloodedMsg(StellarMessage const& msg,
                                 Peer::pointer peer) = 0;
 
     // Return a list of random peers from the set of authenticated peers.
     virtual std::vector<Peer::pointer> getRandomAuthenticatedPeers() = 0;
 
+    // Return a list of random peers from the set of inbound authenticated
+    // peers.
+    virtual std::vector<Peer::pointer> getRandomInboundAuthenticatedPeers() = 0;
+
+    // Return a list of random peers from the set of outbound authenticated
+    // peers.
+    virtual std::vector<Peer::pointer>
+    getRandomOutboundAuthenticatedPeers() = 0;
+
     // Return an already-connected peer at the given address; returns a
     // `nullptr`-valued pointer if no such connected peer exists.
     virtual Peer::pointer getConnectedPeer(PeerBareAddress const& address) = 0;
 
-    // Add a peer to the in-memory set of pending peers.
-    virtual void addPendingPeer(Peer::pointer peer) = 0;
+    // Add new pending inbound connection.
+    virtual void addInboundConnection(Peer::pointer peer) = 0;
 
-    // Forget about a peer, removing it from the in-memory set of connected
-    // peers. Presumably due to it disconnecting.
-    virtual void dropPeer(Peer* peer) = 0;
+    // Add new pending outbound connection. Return true if connection was added.
+    virtual bool addOutboundConnection(Peer::pointer peer) = 0;
+
+    // Remove peer from the in-memory set of connected peers. Can only be
+    // called on peers in Peer::CLOSING state.
+    virtual void removePeer(Peer* peer) = 0;
 
     // Try to move peer from pending to authenticated list. If there is no room
     // for provided peer, it is checked if it is a "preferred" peer (as
@@ -98,35 +112,44 @@ class OverlayManager
     // If moving peer to authenticated list succeeded, true is returned.
     virtual bool acceptAuthenticatedPeer(Peer::pointer peer) = 0;
 
-    virtual bool isPreferred(Peer* peer) = 0;
+    virtual bool isPreferred(Peer* peer) const = 0;
+
+    // Return the current in-memory set of inbound pending peers.
+    virtual std::vector<Peer::pointer> const&
+    getInboundPendingPeers() const = 0;
+
+    // Return the current in-memory set of outbound pending peers.
+    virtual std::vector<Peer::pointer> const&
+    getOutboundPendingPeers() const = 0;
 
     // Return the current in-memory set of pending peers.
-    virtual std::vector<Peer::pointer> const& getPendingPeers() const = 0;
+    virtual std::vector<Peer::pointer> getPendingPeers() const = 0;
 
     // Return number of pending peers
     virtual int getPendingPeersCount() const = 0;
 
-    // Return the current in-memory set of authenticated peers.
+    // Return the current in-memory set of inbound authenticated peers.
     virtual std::map<NodeID, Peer::pointer> const&
-    getAuthenticatedPeers() const = 0;
+    getInboundAuthenticatedPeers() const = 0;
+
+    // Return the current in-memory set of outbound authenticated peers.
+    virtual std::map<NodeID, Peer::pointer> const&
+    getOutboundAuthenticatedPeers() const = 0;
+
+    // Return the current in-memory set of authenticated peers.
+    virtual std::map<NodeID, Peer::pointer> getAuthenticatedPeers() const = 0;
 
     // Return number of authenticated peers
     virtual int getAuthenticatedPeersCount() const = 0;
 
-    // Attempt to connect to a peer identified by string. The form of the string
-    // should be an IP address or hostname, optionally followed by a colon and
-    // a TCP port number.
-    virtual void connectTo(std::string const& addr) = 0;
-
     // Attempt to connect to a peer identified by peer address.
     virtual void connectTo(PeerBareAddress const& address) = 0;
 
-    // Attempt to connect to a peer identified by peer record. Can modify back
-    // off value of pr and save it do database.
-    virtual void connectTo(PeerRecord& pr) = 0;
-
     // returns the list of peers that sent us the item with hash `h`
     virtual std::set<Peer::pointer> getPeersKnows(Hash const& h) = 0;
+
+    // Return the persistent overlay metrics structure.
+    virtual OverlayMetrics& getOverlayMetrics() = 0;
 
     // Return the persistent p2p authentication-key cache.
     virtual PeerAuth& getPeerAuth() = 0;
@@ -134,12 +157,20 @@ class OverlayManager
     // Return the persistent peer-load-accounting cache.
     virtual LoadManager& getLoadManager() = 0;
 
+    // Return the persistent peer manager
+    virtual PeerManager& getPeerManager() = 0;
+
+    virtual SurveyManager& getSurveyManager() = 0;
+
     // start up all background tasks for overlay
     virtual void start() = 0;
     // drops all connections
     virtual void shutdown() = 0;
 
     virtual bool isShuttingDown() const = 0;
+
+    virtual void recordDuplicateMessageMetric(StellarMessage const& stellarMsg,
+                                              Peer::pointer peer) = 0;
 
     virtual ~OverlayManager()
     {

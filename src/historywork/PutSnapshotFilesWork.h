@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "history/FileTransferInfo.h"
 #include "history/HistoryArchive.h"
 #include "work/Work.h"
 
@@ -11,23 +12,26 @@ namespace stellar
 {
 
 struct StateSnapshot;
+class GetHistoryArchiveStateWork;
 
 class PutSnapshotFilesWork : public Work
 {
-    std::shared_ptr<HistoryArchive> mArchive;
     std::shared_ptr<StateSnapshot> mSnapshot;
-    HistoryArchiveState mRemoteState;
 
-    std::shared_ptr<Work> mGetHistoryArchiveStateWork;
-    std::shared_ptr<Work> mPutFilesWork;
-    std::shared_ptr<Work> mPutHistoryArchiveStateWork;
+    // Keep track of each step
+    std::list<std::shared_ptr<GetHistoryArchiveStateWork>> mGetStateWorks;
+    std::list<std::shared_ptr<BasicWork>> mGzipFilesWorks;
+    std::list<std::shared_ptr<BasicWork>> mUploadSeqs;
+
+    std::unordered_set<std::string> getFilesToZip();
 
   public:
-    PutSnapshotFilesWork(Application& app, WorkParent& parent,
-                         std::shared_ptr<HistoryArchive> archive,
+    PutSnapshotFilesWork(Application& app,
                          std::shared_ptr<StateSnapshot> snapshot);
-    ~PutSnapshotFilesWork();
-    void onReset() override;
-    Work::State onSuccess() override;
+    ~PutSnapshotFilesWork() = default;
+
+  protected:
+    State doWork() override;
+    void doReset() override;
 };
 }

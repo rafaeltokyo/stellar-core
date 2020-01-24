@@ -9,6 +9,7 @@
 #include "history/HistoryArchive.h"
 #include "bucket/Bucket.h"
 #include "bucket/BucketList.h"
+#include "bucket/BucketManager.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "history/HistoryManager.h"
@@ -18,14 +19,16 @@
 #include "process/ProcessManager.h"
 #include "util/Fs.h"
 #include "util/Logging.h"
+
 #include <cereal/archives/json.hpp>
 #include <cereal/cereal.hpp>
 #include <cereal/types/vector.hpp>
-
 #include <chrono>
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <medida/meter.h>
+#include <medida/metrics_registry.h>
 #include <set>
 #include <sstream>
 
@@ -44,26 +47,12 @@ formatString(std::string const& templateString, Tokens const&... tokens)
     }
     catch (fmt::FormatError const& ex)
     {
-        CLOG(ERROR, "History") << "failed to format string \"" << templateString
+        CLOG(ERROR, "History") << "Failed to format string \"" << templateString
                                << "\":" << ex.what();
+        CLOG(ERROR, "History")
+            << "Check your HISTORY entry in configuration file";
         throw std::runtime_error("failed to format command string");
     }
-}
-
-bool
-HistoryArchiveState::futuresAllReady() const
-{
-    for (auto const& level : currentBuckets)
-    {
-        if (level.next.isMerging())
-        {
-            if (!level.next.mergeComplete())
-            {
-                return false;
-            }
-        }
-    }
-    return true;
 }
 
 bool
@@ -77,6 +66,14 @@ HistoryArchiveState::futuresAllResolved() const
         }
     }
     return true;
+}
+
+bool
+HistoryArchiveState::futuresAllClear() const
+{
+    return std::all_of(
+        currentBuckets.begin(), currentBuckets.end(),
+        [](HistoryStateBucket const& bl) { return bl.next.isClear(); });
 }
 
 void
@@ -106,7 +103,6 @@ HistoryArchiveState::resolveAnyReadyFutures()
 void
 HistoryArchiveState::save(std::string const& outFile) const
 {
-    assert(futuresAllResolved());
     std::ofstream out(outFile);
     cereal::JSONOutputArchive ar(out);
     serialize(ar);
@@ -115,6 +111,9 @@ HistoryArchiveState::save(std::string const& outFile) const
 std::string
 HistoryArchiveState::toString() const
 {
+    // We serialize-to-a-string any HAS, regardless of resolvedness, as we are
+    // usually doing this to write to the database on the main thread, just as a
+    // durability step: we don't want to block.
     std::ostringstream out;
     {
         cereal::JSONOutputArchive ar(out);
@@ -132,10 +131,9 @@ HistoryArchiveState::load(std::string const& inFile)
     if (version != HISTORY_ARCHIVE_STATE_VERSION)
     {
         CLOG(ERROR, "History")
-            << "unexpected history archive state version: " << version;
+            << "Unexpected history archive state version: " << version;
         throw std::runtime_error("unexpected history archive state version");
     }
-    assert(futuresAllResolved());
 }
 
 void
@@ -144,7 +142,6 @@ HistoryArchiveState::fromString(std::string const& str)
     std::istringstream in(str);
     cereal::JSONInputArchive ar(in);
     serialize(ar);
-    assert(futuresAllResolved());
 }
 
 std::string
@@ -186,7 +183,7 @@ HistoryArchiveState::localName(Application& app, std::string const& archiveName)
 }
 
 Hash
-HistoryArchiveState::getBucketListHash()
+HistoryArchiveState::getBucketListHash() const
 {
     // NB: This hash algorithm has to match "what the BucketList does" to
     // calculate its BucketList hash exactly. It's not a particularly complex
@@ -265,6 +262,83 @@ HistoryArchiveState::allBuckets() const
     return std::vector<std::string>(buckets.begin(), buckets.end());
 }
 
+bool
+HistoryArchiveState::containsValidBuckets(Application& app) const
+{
+    // This function assumes presence of required buckets to verify state
+    // Level 0 future buckets are always clear
+    assert(currentBuckets[0].next.isClear());
+
+    for (uint32_t i = 1; i < BucketList::kNumLevels; i++)
+    {
+        auto& level = currentBuckets[i];
+        auto& prev = currentBuckets[i - 1];
+        Hash const emptyHash;
+
+        auto snap =
+            app.getBucketManager().getBucketByHash(hexToBin256(prev.snap));
+        assert(snap);
+        if (snap->getHash() == emptyHash)
+        {
+            continue;
+        }
+        else if (Bucket::getBucketVersion(snap) >=
+                 Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+        {
+            if (!level.next.isClear())
+            {
+                CLOG(ERROR, "History")
+                    << "Invalid HAS: future must be cleared ";
+                return false;
+            }
+        }
+        else if (!level.next.hasOutputHash())
+        {
+            CLOG(ERROR, "History")
+                << "Invalid HAS: future must have resolved output";
+            return false;
+        }
+    }
+    return true;
+}
+
+void
+HistoryArchiveState::prepareForPublish(Application& app)
+{
+    // Level 0 future buckets are always clear
+    assert(currentBuckets[0].next.isClear());
+
+    for (uint32_t i = 1; i < BucketList::kNumLevels; i++)
+    {
+        auto& level = currentBuckets[i];
+        auto& prev = currentBuckets[i - 1];
+
+        auto snap =
+            app.getBucketManager().getBucketByHash(hexToBin256(prev.snap));
+        if (!level.next.isClear() && Bucket::getBucketVersion(snap) >=
+                                         Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)
+        {
+            level.next.clear();
+        }
+        else if (level.next.hasHashes() && !level.next.isLive())
+        {
+            // Note: this `maxProtocolVersion` is over-approximate. The actual
+            // max for the ledger being published might be lower, but if the
+            // "true" (lower) max-value were actually in conflict with the state
+            // we're about to publish it should have caused an error earlier
+            // anyways, back when the bucket list and HAS for this state was
+            // initially formed. Since we're just reconstituting a HAS here, we
+            // assume it was legit when formed. Given that getting the true
+            // value here therefore doesn't seem to add much checking, and given
+            // that it'd be somewhat convoluted _to_ materialize the true value
+            // here, we're going to live with the approximate value for now.
+            uint32_t maxProtocolVersion =
+                Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+            level.next.makeLive(app, maxProtocolVersion, i);
+        }
+    }
+}
+
 HistoryArchiveState::HistoryArchiveState() : server(STELLAR_CORE_VERSION)
 {
     uint256 u;
@@ -293,8 +367,13 @@ HistoryArchiveState::HistoryArchiveState(uint32_t ledgerSeq,
     }
 }
 
-HistoryArchive::HistoryArchive(HistoryArchiveConfiguration const& config)
+HistoryArchive::HistoryArchive(Application& app,
+                               HistoryArchiveConfiguration const& config)
     : mConfig(config)
+    , mSuccessMeter(app.getMetrics().NewMeter(
+          {"history-archive", config.mName, "success"}, "event"))
+    , mFailureMeter(app.getMetrics().NewMeter(
+          {"history-archive", config.mName, "failure"}, "event"))
 {
 }
 
@@ -355,21 +434,24 @@ HistoryArchive::mkdirCmd(std::string const& remoteDir) const
 void
 HistoryArchive::markSuccess()
 {
-    mSuccess++;
+    mSuccessMeter.Mark();
 }
 
 void
 HistoryArchive::markFailure()
 {
-    mFailure++;
+    mFailureMeter.Mark();
 }
 
-Json::Value
-HistoryArchive::getJsonInfo() const
+uint64_t
+HistoryArchive::getSuccessCount() const
 {
-    Json::Value result;
-    result["success"] = mSuccess;
-    result["failure"] = mFailure;
-    return result;
+    return mSuccessMeter.count();
+}
+
+uint64_t
+HistoryArchive::getFailureCount() const
+{
+    return mFailureMeter.count();
 }
 }

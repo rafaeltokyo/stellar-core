@@ -14,14 +14,6 @@ namespace fs
 {
 
 ////
-// Utility for manipulating process ids
-////
-
-long getCurrentPid();
-
-bool processExists(long pid);
-
-////
 // Utility functions for operating on the filesystem.
 ////
 
@@ -29,6 +21,15 @@ bool processExists(long pid);
 void lockFile(std::string const& path);
 // unlocks a file locked with `lockFile`
 void unlockFile(std::string const& path);
+
+// Call fsync() on POSIX or FlushFileBuffers() on Win32.
+void flushFileChanges(FILE* fp);
+
+// On POSIX, do rename(src, dst) then open dir and fsync() it
+// too: a necessary second step for ensuring durability.
+// On Win32, do MoveFileExA with MOVEFILE_WRITE_THROUGH.
+bool durableRename(std::string const& src, std::string const& dst,
+                   std::string const& dir);
 
 // Whether a path exists
 bool exists(std::string const& path);
@@ -47,6 +48,10 @@ bool mkpath(std::string const& path);
 std::vector<std::string>
 findfiles(std::string const& path,
           std::function<bool(std::string const& name)> predicate);
+
+size_t size(std::ifstream& ifs);
+
+size_t size(std::string const& path);
 
 class PathSplitter
 {

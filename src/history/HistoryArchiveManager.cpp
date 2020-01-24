@@ -10,9 +10,8 @@
 #include "main/Config.h"
 #include "util/Logging.h"
 #include "util/Math.h"
-#include "work/WorkManager.h"
+#include "work/WorkScheduler.h"
 
-#include <lib/json/json.h>
 #include <vector>
 
 namespace stellar
@@ -22,7 +21,7 @@ HistoryArchiveManager::HistoryArchiveManager(Application& app) : mApp{app}
 {
     for (auto const& archiveConfiguration : mApp.getConfig().HISTORY)
         mArchives.push_back(
-            std::make_shared<HistoryArchive>(archiveConfiguration.second));
+            std::make_shared<HistoryArchive>(app, archiveConfiguration.second));
 }
 
 bool
@@ -168,15 +167,14 @@ HistoryArchiveManager::initializeHistoryArchive(std::string const& arch) const
         return false;
     }
 
-    auto& wm = mApp.getWorkManager();
+    auto& ws = mApp.getWorkScheduler();
 
     // First check that there's no existing HAS in the archive
-    HistoryArchiveState existing;
     CLOG(INFO, "History") << "Probing history archive '" << arch
                           << "' for existing state";
-    auto getHas = wm.executeWork<GetHistoryArchiveStateWork>(
-        "get-history-archive-state", existing, 0, archive, 0);
-    if (getHas->getState() == Work::WORK_SUCCESS)
+    auto getHas =
+        ws.executeWork<GetHistoryArchiveStateWork>(0, archive, "hist-init", 0);
+    if (getHas->getState() == BasicWork::State::WORK_SUCCESS)
     {
         CLOG(ERROR, "History")
             << "History archive '" << arch << "' already initialized!";
@@ -189,8 +187,8 @@ HistoryArchiveManager::initializeHistoryArchive(std::string const& arch) const
     CLOG(INFO, "History") << "Initializing history archive '" << arch << "'";
     has.resolveAllFutures();
 
-    auto putHas = wm.executeWork<PutHistoryArchiveStateWork>(has, archive);
-    if (putHas->getState() == Work::WORK_SUCCESS)
+    auto putHas = ws.executeWork<PutHistoryArchiveStateWork>(has, archive);
+    if (putHas->getState() == BasicWork::State::WORK_SUCCESS)
     {
         CLOG(INFO, "History") << "Initialized history archive '" << arch << "'";
         return true;
@@ -234,16 +232,26 @@ HistoryArchiveManager::getWritableHistoryArchives() const
     return result;
 }
 
-Json::Value
-HistoryArchiveManager::getJsonInfo() const
+double
+HistoryArchiveManager::getFailureRate() const
 {
-    auto info = Json::Value{};
+    uint64_t successCount{0};
+    uint64_t failureCount{0};
 
     for (auto archive : mArchives)
     {
-        info[archive->getName()] = archive->getJsonInfo();
+        successCount += archive->getSuccessCount();
+        failureCount += archive->getFailureCount();
     }
 
-    return info;
+    auto total = successCount + failureCount;
+    if (total == 0)
+    {
+        return 0.0;
+    }
+    else
+    {
+        return static_cast<double>(failureCount) / total;
+    }
 }
 }

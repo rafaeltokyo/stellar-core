@@ -4,9 +4,10 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "PendingEnvelopes.h"
 #include "herder/Herder.h"
 #include "herder/HerderSCPDriver.h"
+#include "herder/PendingEnvelopes.h"
+#include "herder/TransactionQueue.h"
 #include "herder/Upgrades.h"
 #include "util/Timer.h"
 #include "util/XDROperators.h"
@@ -57,7 +58,8 @@ class HerderImpl : public Herder
     void valueExternalized(uint64 slotIndex, StellarValue const& value);
     void emitEnvelope(SCPEnvelope const& envelope);
 
-    TransactionSubmitStatus recvTransaction(TransactionFramePtr tx) override;
+    TransactionQueue::AddResult
+    recvTransaction(TransactionFramePtr tx) override;
 
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope) override;
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
@@ -86,40 +88,48 @@ class HerderImpl : public Herder
 
     bool resolveNodeID(std::string const& s, PublicKey& retKey) override;
 
-    Json::Value getJsonInfo(size_t limit) override;
-    Json::Value getJsonQuorumInfo(NodeID const& id, bool summary,
+    Json::Value getJsonInfo(size_t limit, bool fullKeys = false) override;
+    Json::Value getJsonQuorumInfo(NodeID const& id, bool summary, bool fullKeys,
                                   uint64 index) override;
+    Json::Value getJsonTransitiveQuorumIntersectionInfo(bool fullKeys) const;
+    virtual Json::Value getJsonTransitiveQuorumInfo(NodeID const& id,
+                                                    bool summary,
+                                                    bool fullKeys) override;
+    QuorumTracker::QuorumMap const& getCurrentlyTrackedQuorum() const override;
 
-    struct TxMap
-    {
-        SequenceNumber mMaxSeq{0};
-        int64_t mTotalFees{0};
-        std::unordered_map<Hash, TransactionFramePtr> mTransactions;
-        void addTx(TransactionFramePtr);
-        void recalculate();
-    };
-    typedef std::unordered_map<AccountID, std::shared_ptr<TxMap>> AccountTxMap;
+#ifdef BUILD_TESTS
+    // used for testing
+    PendingEnvelopes& getPendingEnvelopes();
+#endif
+
+    // helper function to verify envelopes are signed
+    bool verifyEnvelope(SCPEnvelope const& envelope);
+    // helper function to sign envelopes
+    void signEnvelope(SecretKey const& s, SCPEnvelope& envelope);
+
+    // helper function to verify SCPValues are signed
+    bool verifyStellarValueSignature(StellarValue const& sv);
+    // helper function to sign SCPValues
+    void signStellarValue(SecretKey const& s, StellarValue& sv);
 
   private:
+    // return true if values referenced by envelope have a valid close time:
+    // * it's within the allowed range (using lcl if possible)
+    // * it's recent enough (if `enforceRecent` is set)
+    bool checkCloseTime(SCPEnvelope const& envelope, bool enforceRecent);
+
     void ledgerClosed();
-    void removeReceivedTxs(std::vector<TransactionFramePtr> const& txs);
 
     void startRebroadcastTimer();
     void rebroadcast();
     void broadcast(SCPEnvelope const& e);
 
-    void updateSCPCounters();
-
     void processSCPQueueUpToIndex(uint64 slotIndex);
 
-    // 0- tx we got during ledger close
-    // 1- one ledger ago. rebroadcast
-    // 2- two ledgers ago. rebroadcast
-    // ...
-    std::deque<AccountTxMap> mPendingTransactions;
+    TransactionQueue mTransactionQueue;
 
     void
-    updatePendingTransactions(std::vector<TransactionFramePtr> const& applied);
+    updateTransactionQueue(std::vector<TransactionFramePtr> const& applied);
 
     PendingEnvelopes mPendingEnvelopes;
     Upgrades mUpgrades;
@@ -127,12 +137,18 @@ class HerderImpl : public Herder
 
     void herderOutOfSync();
 
+    // attempt to retrieve additional SCP messages from peers
+    void getMoreSCPState();
+
     // last slot that was persisted into the database
-    // only keep track of the most recent slot
+    // keep track of all messages for MAX_SLOTS_TO_REMEMBER slots
     uint64 mLastSlotSaved;
 
     // timer that detects that we're stuck on an SCP slot
     VirtualTimer mTrackingTimer;
+
+    // tracks the last time externalize was called
+    VirtualClock::time_point mLastExternalize;
 
     // saves the SCP messages that the instance sent out last
     void persistSCPState(uint64 slot);
@@ -159,29 +175,49 @@ class HerderImpl : public Herder
     {
         medida::Meter& mLostSync;
 
-        medida::Meter& mBallotExpire;
-
         medida::Meter& mEnvelopeEmit;
         medida::Meter& mEnvelopeReceive;
-
-        // Counters for stuff in parent class (SCP)
-        // that we monitor on a best-effort basis from
-        // here.
-        medida::Counter& mKnownSlotsSize;
 
         // Counters for things reached-through the
         // SCP maps: Slots and Nodes
         medida::Counter& mCumulativeStatements;
 
-        // Pending tx buffer sizes
-        medida::Counter& mHerderPendingTxs0;
-        medida::Counter& mHerderPendingTxs1;
-        medida::Counter& mHerderPendingTxs2;
-        medida::Counter& mHerderPendingTxs3;
+        // envelope signature verification
+        medida::Meter& mEnvelopeValidSig;
+        medida::Meter& mEnvelopeInvalidSig;
 
         SCPMetrics(Application& app);
     };
 
     SCPMetrics mSCPMetrics;
+
+    // Check that the quorum map intersection state is up to date, and if not
+    // run a background job that re-analyzes the current quorum map.
+    void checkAndMaybeReanalyzeQuorumMap();
+
+    struct QuorumMapIntersectionState
+    {
+        uint32_t mLastCheckLedger{0};
+        uint32_t mLastGoodLedger{0};
+        size_t mNumNodes{0};
+        Hash mLastCheckQuorumMapHash{};
+        bool mRecalculating{false};
+        std::pair<std::vector<PublicKey>, std::vector<PublicKey>>
+            mPotentialSplit{};
+        std::set<std::set<PublicKey>> mIntersectionCriticalNodes{};
+
+        bool
+        hasAnyResults() const
+        {
+            return mLastGoodLedger != 0;
+        }
+
+        bool
+        enjoysQuorunIntersection() const
+        {
+            return mLastCheckLedger == mLastGoodLedger;
+        }
+    };
+    QuorumMapIntersectionState mLastQuorumMapIntersectionState;
 };
 }

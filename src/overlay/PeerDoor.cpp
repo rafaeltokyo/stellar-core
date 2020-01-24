@@ -18,7 +18,7 @@ using asio::ip::tcp;
 using namespace std;
 
 PeerDoor::PeerDoor(Application& app)
-    : mApp(app), mAcceptor(mApp.getClock().getIOService())
+    : mApp(app), mAcceptor(mApp.getClock().getIOContext())
 {
 }
 
@@ -28,7 +28,7 @@ PeerDoor::start()
     if (!mApp.getConfig().RUN_STANDALONE)
     {
         tcp::endpoint endpoint(tcp::v4(), mApp.getConfig().PEER_PORT);
-        CLOG(DEBUG, "Overlay") << "PeerDoor binding to endpoint " << endpoint;
+        CLOG(INFO, "Overlay") << "Binding to endpoint " << endpoint;
         mAcceptor.open(endpoint.protocol());
         mAcceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
         mAcceptor.bind(endpoint);
@@ -58,7 +58,7 @@ PeerDoor::acceptNextPeer()
 
     CLOG(DEBUG, "Overlay") << "PeerDoor acceptNextPeer()";
     auto sock =
-        make_shared<TCPPeer::SocketType>(mApp.getClock().getIOService());
+        make_shared<TCPPeer::SocketType>(mApp.getClock().getIOContext());
     mAcceptor.async_accept(sock->next_layer(),
                            [this, sock](asio::error_code const& ec) {
                                if (ec)
@@ -76,7 +76,7 @@ PeerDoor::handleKnock(shared_ptr<TCPPeer::SocketType> socket)
     Peer::pointer peer = TCPPeer::accept(mApp, socket);
     if (peer)
     {
-        mApp.getOverlayManager().addPendingPeer(peer);
+        mApp.getOverlayManager().addInboundConnection(peer);
     }
     acceptNextPeer();
 }

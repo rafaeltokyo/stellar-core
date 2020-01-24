@@ -7,24 +7,16 @@
 #include "crypto/SignerKey.h"
 #include "database/Database.h"
 #include "invariant/InvariantManager.h"
-#include "ledger/DataFrame.h"
-#include "ledger/LedgerDelta.h"
+#include "ledger/LedgerTxn.h"
+#include "ledger/LedgerTxnEntry.h"
+#include "ledger/LedgerTxnHeader.h"
 #include "main/Application.h"
 #include "test/TestExceptions.h"
 #include "test/TestUtils.h"
 #include "test/test.h"
-#include "transactions/AllowTrustOpFrame.h"
-#include "transactions/BumpSequenceOpFrame.h"
-#include "transactions/ChangeTrustOpFrame.h"
-#include "transactions/CreateAccountOpFrame.h"
-#include "transactions/InflationOpFrame.h"
-#include "transactions/ManageDataOpFrame.h"
-#include "transactions/ManageOfferOpFrame.h"
-#include "transactions/MergeOpFrame.h"
-#include "transactions/PathPaymentOpFrame.h"
-#include "transactions/PaymentOpFrame.h"
-#include "transactions/SetOptionsOpFrame.h"
+#include "transactions/OperationFrame.h"
 #include "transactions/TransactionFrame.h"
+#include "transactions/TransactionUtils.h"
 #include "util/Logging.h"
 #include "util/XDROperators.h"
 #include "util/types.h"
@@ -34,32 +26,58 @@
 using namespace stellar;
 using namespace stellar::txtest;
 
-typedef std::unique_ptr<Application> appPtr;
 namespace stellar
 {
 namespace txtest
 {
 
-ExpectedOpResult::ExpectedOpResult(OperationResultCode code) : code{code}
+ExpectedOpResult::ExpectedOpResult(OperationResultCode code)
 {
+    mOperationResult.code(code);
 }
+
 ExpectedOpResult::ExpectedOpResult(CreateAccountResultCode createAccountCode)
-    : code{opINNER}, type{CREATE_ACCOUNT}, createAccountCode{createAccountCode}
 {
+    mOperationResult.code(opINNER);
+    mOperationResult.tr().type(CREATE_ACCOUNT);
+    mOperationResult.tr().createAccountResult().code(createAccountCode);
 }
+
 ExpectedOpResult::ExpectedOpResult(PaymentResultCode paymentCode)
-    : code{opINNER}, type{PAYMENT}, paymentCode{paymentCode}
 {
+    mOperationResult.code(opINNER);
+    mOperationResult.tr().type(PAYMENT);
+    mOperationResult.tr().paymentResult().code(paymentCode);
 }
+
 ExpectedOpResult::ExpectedOpResult(AccountMergeResultCode accountMergeCode)
-    : code{opINNER}, type{ACCOUNT_MERGE}, accountMergeCode{accountMergeCode}
 {
+    mOperationResult.code(opINNER);
+    mOperationResult.tr().type(ACCOUNT_MERGE);
+    mOperationResult.tr().accountMergeResult().code(accountMergeCode);
 }
-ExpectedOpResult::ExpectedOpResult(SetOptionsResultCode setOptionsResultCode)
-    : code{opINNER}
-    , type{SET_OPTIONS}
-    , setOptionsResultCode{setOptionsResultCode}
+
+ExpectedOpResult::ExpectedOpResult(AccountMergeResultCode accountMergeCode,
+                                   int64_t sourceAccountBalance)
 {
+    if (accountMergeCode != ACCOUNT_MERGE_SUCCESS)
+    {
+        throw std::logic_error("accountMergeCode must be ACCOUNT_MERGE_SUCCESS "
+                               "when sourceAccountBalance is passed");
+    }
+
+    mOperationResult.code(opINNER);
+    mOperationResult.tr().type(ACCOUNT_MERGE);
+    mOperationResult.tr().accountMergeResult().code(ACCOUNT_MERGE_SUCCESS);
+    mOperationResult.tr().accountMergeResult().sourceAccountBalance() =
+        sourceAccountBalance;
+}
+
+ExpectedOpResult::ExpectedOpResult(SetOptionsResultCode setOptionsResultCode)
+{
+    mOperationResult.code(opINNER);
+    mOperationResult.tr().type(SET_OPTIONS);
+    mOperationResult.tr().setOptionsResult().code(setOptionsResultCode);
 }
 
 TransactionResult
@@ -69,42 +87,20 @@ expectedResult(int64_t fee, size_t opsCount, TransactionResultCode code,
     auto result = TransactionResult{};
     result.feeCharged = fee;
     result.result.code(code);
+
     if (code != txSUCCESS && code != txFAILED)
     {
         return result;
     }
+
     if (ops.empty())
     {
         std::fill_n(std::back_inserter(ops), opsCount, PAYMENT_SUCCESS);
     }
 
-    result.result.results().resize(static_cast<uint32_t>(ops.size()));
-    for (size_t i = 0; i < ops.size(); i++)
+    for (auto const& op : ops)
     {
-        auto& r = result.result.results()[i];
-        auto& o = ops[i];
-        r.code(o.code);
-        if (o.code == opINNER)
-        {
-            r.tr().type(o.type);
-            switch (o.type)
-            {
-            case CREATE_ACCOUNT:
-                r.tr().createAccountResult().code(o.createAccountCode);
-                break;
-            case PAYMENT:
-                r.tr().paymentResult().code(o.paymentCode);
-                break;
-            case ACCOUNT_MERGE:
-                r.tr().accountMergeResult().code(o.accountMergeCode);
-                break;
-            case SET_OPTIONS:
-                r.tr().setOptionsResult().code(o.setOptionsResultCode);
-                break;
-            default:
-                break;
-            }
-        }
+        result.result.results().push_back(op.mOperationResult);
     }
 
     return result;
@@ -113,78 +109,83 @@ expectedResult(int64_t fee, size_t opsCount, TransactionResultCode code,
 bool
 applyCheck(TransactionFramePtr tx, Application& app, bool checkSeqNum)
 {
-    app.getDatabase().clearPreparedStatementCache();
+    LedgerTxn ltx(app.getLedgerTxnRoot());
+    // Increment ledgerSeq to simulate the behavior of closeLedger, which begins
+    // by advancing the ledgerSeq.
+    ++ltx.loadHeader().current().ledgerSeq;
 
-    LedgerDelta delta(app.getLedgerManager().getCurrentLedgerHeader(),
-                      app.getDatabase());
-
+    bool check = false;
+    TransactionResult checkResult;
+    TransactionResultCode code;
     AccountEntry srcAccountBefore;
-
-    bool check = tx->checkValid(app, 0);
-    TransactionResult checkResult = tx->getResult();
-
-    REQUIRE((!check || checkResult.result.code() == txSUCCESS));
-
-    // now, check what happens when simulating what happens during a ledger
-    // close and reconcile it with the return value of "apply" with the one from
-    // checkValid:
-    // * an invalid (as per isValid) tx is still invalid during apply (and the
-    // same way)
-    // * a valid tx can fail later
-    auto code = checkResult.result.code();
-    if (code != txNO_ACCOUNT)
     {
-        auto acnt = loadAccount(tx->getSourceID(), app, true);
-        srcAccountBefore = acnt->getAccount();
+        LedgerTxn ltxFeeProc(ltx);
+        check = tx->checkValid(ltxFeeProc, 0);
+        checkResult = tx->getResult();
+        REQUIRE((!check || checkResult.result.code() == txSUCCESS));
 
-        // no account -> can't process the fee
-        tx->processFeeSeqNum(delta, app.getLedgerManager());
-
-        // verify that the fee got processed
-        auto added = delta.added();
-        REQUIRE(added.begin() == added.end());
-        auto deleted = delta.deleted();
-        REQUIRE(deleted.begin() == deleted.end());
-        auto modified = delta.modified();
-        REQUIRE(modified.begin() != modified.end());
-        int modifiedCount = 0;
-        for (auto m : modified)
+        // now, check what happens when simulating what happens during a ledger
+        // close and reconcile it with the return value of "apply" with the one
+        // from checkValid:
+        // * an invalid (as per isValid) tx is still invalid during apply (and
+        // the same way)
+        // * a valid tx can fail later
+        code = checkResult.result.code();
+        if (code != txNO_ACCOUNT)
         {
-            modifiedCount++;
-            REQUIRE(modifiedCount == 1);
-            REQUIRE(m.key.account().accountID == tx->getSourceID());
-            auto& prevAccount = m.previous->mEntry.data.account();
-            REQUIRE(prevAccount == srcAccountBefore);
-            auto curAccount = m.current->mEntry.data.account();
-            // the balance should have changed
-            REQUIRE(curAccount.balance < prevAccount.balance);
-            curAccount.balance = prevAccount.balance;
-            if (app.getLedgerManager().getCurrentLedgerVersion() <= 9)
+            srcAccountBefore = loadAccount(ltxFeeProc, tx->getSourceID(), true)
+                                   .current()
+                                   .data.account();
+
+            // no account -> can't process the fee
+            auto baseFee = ltxFeeProc.loadHeader().current().baseFee;
+            tx->processFeeSeqNum(ltxFeeProc, baseFee);
+            uint32_t ledgerVersion =
+                ltxFeeProc.loadHeader().current().ledgerVersion;
+
+            // verify that the fee got processed
+            auto ltxDelta = ltxFeeProc.getDelta();
+            REQUIRE(ltxDelta.entry.size() == 1);
+            auto current = ltxDelta.entry.begin()->second.current;
+            REQUIRE(current);
+            auto previous = ltxDelta.entry.begin()->second.previous;
+            REQUIRE(previous);
+            auto currAcc = current->data.account();
+            auto prevAcc = previous->data.account();
+            REQUIRE(prevAcc == srcAccountBefore);
+            REQUIRE(currAcc.accountID == tx->getSourceID());
+            REQUIRE(currAcc.balance < prevAcc.balance);
+            currAcc.balance = prevAcc.balance;
+            if (ledgerVersion <= 9)
             {
                 // v9 and below, we also need to verify that the sequence number
                 // also got processed at this time
-                REQUIRE(curAccount.seqNum == (prevAccount.seqNum + 1));
-                curAccount.seqNum = prevAccount.seqNum;
+                REQUIRE(currAcc.seqNum == prevAcc.seqNum + 1);
+                currAcc.seqNum = prevAcc.seqNum;
             }
-            REQUIRE(curAccount == prevAccount);
+            REQUIRE(currAcc == prevAcc);
         }
+        ltxFeeProc.commit();
     }
 
     bool res = false;
-
     {
-        LedgerDelta applyDelta(delta);
+        LedgerTxn ltxTx(ltx);
+        TransactionMeta tm(2);
         try
         {
-            res = tx->apply(applyDelta, app);
+            res = tx->apply(app, ltxTx, tm);
         }
         catch (...)
         {
             tx->getResult().result.code(txINTERNAL_ERROR);
         }
-
         REQUIRE((!res || tx->getResultCode() == txSUCCESS));
 
+        if (!res || tx->getResultCode() != txSUCCESS)
+        {
+            REQUIRE(tm.v2().operations.size() == 0);
+        }
         // checks that the failure is the same if pre checks failed
         if (!check)
         {
@@ -211,7 +212,7 @@ applyCheck(TransactionFramePtr tx, Application& app, bool checkSeqNum)
         if (code != txNO_ACCOUNT)
         {
             auto srcAccountAfter =
-                txtest::loadAccount(srcAccountBefore.accountID, app, false);
+                loadAccount(ltxTx, srcAccountBefore.accountID, false);
             if (srcAccountAfter)
             {
                 bool earlyFailure =
@@ -221,47 +222,44 @@ applyCheck(TransactionFramePtr tx, Application& app, bool checkSeqNum)
                 // verify that the sequence number changed (v10+)
                 // do not perform the check if there was a failure before
                 // or during the sequence number processing
-                if (checkSeqNum &&
-                    app.getLedgerManager().getCurrentLedgerVersion() >= 10 &&
+                auto header = ltxTx.loadHeader();
+                if (checkSeqNum && header.current().ledgerVersion >= 10 &&
                     !earlyFailure)
                 {
-                    REQUIRE(srcAccountAfter->getSeqNum() ==
+                    REQUIRE(srcAccountAfter.current().data.account().seqNum ==
                             (srcAccountBefore.seqNum + 1));
                 }
                 // on failure, no other changes should have been made
                 if (!res)
                 {
-                    auto added = applyDelta.added();
-                    REQUIRE(added.begin() == added.end());
-                    auto deleted = applyDelta.deleted();
-                    REQUIRE(deleted.begin() == deleted.end());
-                    auto modified = applyDelta.modified();
-                    if (earlyFailure ||
-                        app.getLedgerManager().getCurrentLedgerVersion() <= 9)
+                    if (earlyFailure || header.current().ledgerVersion <= 9)
                     {
                         // no changes during an early failure
-                        REQUIRE(modified.begin() == modified.end());
+                        REQUIRE(ltxTx.getDelta().entry.empty());
                     }
                     else
                     {
-                        REQUIRE(modified.begin() != modified.end());
-                        for (auto m : modified)
+                        auto ltxDelta = ltxTx.getDelta();
+                        for (auto const& kvp : ltxDelta.entry)
                         {
-                            REQUIRE(m.key.account().accountID ==
-                                    srcAccountBefore.accountID);
-                            // could check more here if needed
+                            auto current = kvp.second.current;
+                            REQUIRE(current);
+                            auto previous = kvp.second.previous;
+                            REQUIRE(previous);
                         }
+                        // could check more here if needed
                     }
                 }
             }
         }
-        applyDelta.commit();
+        ltxTx.commit();
     }
 
-    // validates db state
-    app.getLedgerManager().checkDbState();
-    delta.commit();
-
+    // Undo the increment from the beginning of this function. Note that if this
+    // function exits without reaching this point, then ltx will not be
+    // committed and the increment will be rolled back anyway.
+    --ltx.loadHeader().current().ledgerSeq;
+    ltx.commit();
     return res;
 }
 
@@ -269,7 +267,7 @@ void
 checkTransaction(TransactionFrame& txFrame, Application& app)
 {
     REQUIRE(txFrame.getResult().feeCharged ==
-            app.getLedgerManager().getTxFee());
+            app.getLedgerManager().getLastTxFee());
     REQUIRE((txFrame.getResultCode() == txSUCCESS ||
              txFrame.getResultCode() == txFAILED));
 }
@@ -288,7 +286,10 @@ validateTxResults(TransactionFramePtr const& tx, Application& app,
                   TransactionResult const& applyResult)
 {
     auto shouldValidateOk = validationResult.code == txSUCCESS;
-    REQUIRE(tx->checkValid(app, 0) == shouldValidateOk);
+    {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        REQUIRE(tx->checkValid(ltx, 0) == shouldValidateOk);
+    }
     REQUIRE(tx->getResult().result.code() == validationResult.code);
     REQUIRE(tx->getResult().feeCharged == validationResult.fee);
 
@@ -301,7 +302,6 @@ validateTxResults(TransactionFramePtr const& tx, Application& app,
 
     switch (applyResult.result.code())
     {
-    case txINTERNAL_ERROR:
     case txBAD_AUTH_EXTRA:
     case txBAD_SEQ:
         return;
@@ -331,7 +331,7 @@ closeLedgerOn(Application& app, uint32 ledgerSeq, int day, int month, int year,
     REQUIRE(txSet->checkValid(app));
 
     StellarValue sv(txSet->getContentsHash(), getTestDate(day, month, year),
-                    emptyUpgradeSteps, 0);
+                    emptyUpgradeSteps, STELLAR_VALUE_BASIC);
     LedgerCloseData ledgerData(ledgerSeq, txSet, sv);
     app.getLedgerManager().closeLedger(ledgerData);
 
@@ -340,7 +340,7 @@ closeLedgerOn(Application& app, uint32 ledgerSeq, int day, int month, int year,
     auto z2 =
         TransactionFrame::getTransactionFeeMeta(app.getDatabase(), ledgerSeq);
 
-    REQUIRE(app.getLedgerManager().getLedgerNum() == (ledgerSeq + 1));
+    REQUIRE(app.getLedgerManager().getLastClosedLedgerNum() == ledgerSeq);
 
     TxSetResultMeta res;
     std::transform(
@@ -360,7 +360,7 @@ getRoot(Hash const& networkID)
 }
 
 SecretKey
-getAccount(const char* n)
+getAccount(std::string const& n)
 {
     // stretch seed to 32 bytes
     std::string seed(n);
@@ -375,10 +375,10 @@ makeSigner(SecretKey key, int weight)
     return Signer{KeyUtils::convertKey<SignerKey>(key.getPublicKey()), weight};
 }
 
-AccountFrame::pointer
-loadAccount(PublicKey const& k, Application& app, bool mustExist)
+ConstLedgerTxnEntry
+loadAccount(AbstractLedgerTxn& ltx, PublicKey const& k, bool mustExist)
 {
-    auto res = AccountFrame::loadAccount(k, app.getDatabase());
+    auto res = stellar::loadAccountWithoutRecord(ltx, k);
     if (mustExist)
     {
         REQUIRE(res);
@@ -386,54 +386,33 @@ loadAccount(PublicKey const& k, Application& app, bool mustExist)
     return res;
 }
 
-void
-requireNoAccount(PublicKey const& k, Application& app)
+bool
+doesAccountExist(Application& app, PublicKey const& k)
 {
-    AccountFrame::pointer res = loadAccount(k, app, false);
-    REQUIRE(!res);
-}
-
-OfferFrame::pointer
-loadOffer(PublicKey const& k, uint64 offerID, Application& app, bool mustExist)
-{
-    OfferFrame::pointer res =
-        OfferFrame::loadOffer(k, offerID, app.getDatabase());
-    if (mustExist)
-    {
-        REQUIRE(res);
-    }
-    return res;
-}
-
-TrustFrame::pointer
-loadTrustLine(SecretKey const& k, Asset const& asset, Application& app,
-              bool mustExist)
-{
-    TrustFrame::pointer res =
-        TrustFrame::loadTrustLine(k.getPublicKey(), asset, app.getDatabase());
-    if (mustExist)
-    {
-        REQUIRE(res);
-    }
-    return res;
+    LedgerTxn ltx(app.getLedgerTxnRoot());
+    return (bool)stellar::loadAccountWithoutRecord(ltx, k);
 }
 
 xdr::xvector<Signer, 20>
 getAccountSigners(PublicKey const& k, Application& app)
 {
-    AccountFrame::pointer account;
-    account = loadAccount(k, app);
-    return account->getAccount().signers;
+    LedgerTxn ltx(app.getLedgerTxnRoot());
+    auto account = stellar::loadAccount(ltx, k);
+    return account.current().data.account().signers;
 }
 
 TransactionFramePtr
 transactionFromOperations(Application& app, SecretKey const& from,
-                          SequenceNumber seq, const std::vector<Operation>& ops)
+                          SequenceNumber seq, const std::vector<Operation>& ops,
+                          int fee)
 {
     auto e = TransactionEnvelope{};
     e.tx.sourceAccount = from.getPublicKey();
-    e.tx.fee = static_cast<uint32_t>(
-        (ops.size() * app.getLedgerManager().getTxFee()) & UINT32_MAX);
+    e.tx.fee = fee != 0
+                   ? fee
+                   : static_cast<uint32_t>(
+                         (ops.size() * app.getLedgerManager().getLastTxFee()) &
+                         UINT32_MAX);
     e.tx.seqNum = seq;
     std::copy(std::begin(ops), std::end(ops),
               std::back_inserter(e.tx.operations));
@@ -549,8 +528,8 @@ pathPayment(PublicKey const& to, Asset const& sendCur, int64_t sendMax,
             std::vector<Asset> const& path)
 {
     Operation op;
-    op.body.type(PATH_PAYMENT);
-    PathPaymentOp& ppop = op.body.pathPaymentOp();
+    op.body.type(PATH_PAYMENT_STRICT_RECEIVE);
+    PathPaymentStrictReceiveOp& ppop = op.body.pathPaymentStrictReceiveOp();
     ppop.sendAsset = sendCur;
     ppop.sendMax = sendMax;
     ppop.destAsset = destCur;
@@ -562,42 +541,77 @@ pathPayment(PublicKey const& to, Asset const& sendCur, int64_t sendMax,
 }
 
 Operation
-createPassiveOffer(Asset const& selling, Asset const& buying,
-                   Price const& price, int64_t amount)
+pathPaymentStrictSend(PublicKey const& to, Asset const& sendCur,
+                      int64_t sendAmount, Asset const& destCur, int64_t destMin,
+                      std::vector<Asset> const& path)
 {
     Operation op;
-    op.body.type(CREATE_PASSIVE_OFFER);
-    op.body.createPassiveOfferOp().amount = amount;
-    op.body.createPassiveOfferOp().selling = selling;
-    op.body.createPassiveOfferOp().buying = buying;
-    op.body.createPassiveOfferOp().price = price;
+    op.body.type(PATH_PAYMENT_STRICT_SEND);
+    PathPaymentStrictSendOp& ppop = op.body.pathPaymentStrictSendOp();
+    ppop.sendAsset = sendCur;
+    ppop.sendAmount = sendAmount;
+    ppop.destAsset = destCur;
+    ppop.destMin = destMin;
+    ppop.destination = to;
+    std::copy(std::begin(path), std::end(path), std::back_inserter(ppop.path));
 
     return op;
 }
 
 Operation
-manageOffer(uint64 offerId, Asset const& selling, Asset const& buying,
-            Price const& price, int64_t amount)
+createPassiveOffer(Asset const& selling, Asset const& buying,
+                   Price const& price, int64_t amount)
 {
     Operation op;
-    op.body.type(MANAGE_OFFER);
-    op.body.manageOfferOp().amount = amount;
-    op.body.manageOfferOp().selling = selling;
-    op.body.manageOfferOp().buying = buying;
-    op.body.manageOfferOp().offerID = offerId;
-    op.body.manageOfferOp().price = price;
+    op.body.type(CREATE_PASSIVE_SELL_OFFER);
+    op.body.createPassiveSellOfferOp().amount = amount;
+    op.body.createPassiveSellOfferOp().selling = selling;
+    op.body.createPassiveSellOfferOp().buying = buying;
+    op.body.createPassiveSellOfferOp().price = price;
 
     return op;
 }
 
-static ManageOfferResult
-applyCreateOfferHelper(Application& app, uint64 offerId,
-                       SecretKey const& source, Asset const& selling,
-                       Asset const& buying, Price const& price, int64_t amount,
-                       SequenceNumber seq)
+Operation
+manageOffer(int64 offerId, Asset const& selling, Asset const& buying,
+            Price const& price, int64_t amount)
 {
-    auto lastGeneratedID =
-        app.getLedgerManager().getCurrentLedgerHeader().idPool;
+    Operation op;
+    op.body.type(MANAGE_SELL_OFFER);
+    op.body.manageSellOfferOp().amount = amount;
+    op.body.manageSellOfferOp().selling = selling;
+    op.body.manageSellOfferOp().buying = buying;
+    op.body.manageSellOfferOp().offerID = offerId;
+    op.body.manageSellOfferOp().price = price;
+
+    return op;
+}
+
+Operation
+manageBuyOffer(int64 offerId, Asset const& selling, Asset const& buying,
+               Price const& price, int64_t amount)
+{
+    Operation op;
+    op.body.type(MANAGE_BUY_OFFER);
+    op.body.manageBuyOfferOp().buyAmount = amount;
+    op.body.manageBuyOfferOp().selling = selling;
+    op.body.manageBuyOfferOp().buying = buying;
+    op.body.manageBuyOfferOp().offerID = offerId;
+    op.body.manageBuyOfferOp().price = price;
+
+    return op;
+}
+
+static ManageSellOfferResult
+applyCreateOfferHelper(Application& app, int64 offerId, SecretKey const& source,
+                       Asset const& selling, Asset const& buying,
+                       Price const& price, int64_t amount, SequenceNumber seq)
+{
+    auto getIdPool = [&]() {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        return ltx.loadHeader().current().idPool;
+    };
+    auto lastGeneratedID = getIdPool();
     auto expectedOfferID = lastGeneratedID + 1;
     if (offerId != 0)
     {
@@ -613,8 +627,7 @@ applyCreateOfferHelper(Application& app, uint64 offerId,
     }
     catch (...)
     {
-        REQUIRE(app.getLedgerManager().getCurrentLedgerHeader().idPool ==
-                lastGeneratedID);
+        REQUIRE(getIdPool() == lastGeneratedID);
         throw;
     }
 
@@ -622,19 +635,20 @@ applyCreateOfferHelper(Application& app, uint64 offerId,
 
     REQUIRE(results.size() == 1);
 
-    auto& manageOfferResult = results[0].tr().manageOfferResult();
+    auto& manageSellOfferResult = results[0].tr().manageSellOfferResult();
 
-    OfferFrame::pointer offer;
-
-    auto& offerResult = manageOfferResult.success().offer;
+    auto& offerResult = manageSellOfferResult.success().offer;
 
     switch (offerResult.effect())
     {
     case MANAGE_OFFER_CREATED:
     case MANAGE_OFFER_UPDATED:
     {
-        offer = loadOffer(source.getPublicKey(), expectedOfferID, app, true);
-        auto& offerEntry = offer->getOffer();
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        auto offer =
+            stellar::loadOffer(ltx, source.getPublicKey(), expectedOfferID);
+        REQUIRE(offer);
+        auto& offerEntry = offer.current().data.offer();
         REQUIRE(offerEntry == offerResult.offer());
         REQUIRE(offerEntry.price == price);
         REQUIRE(offerEntry.selling == selling);
@@ -642,22 +656,26 @@ applyCreateOfferHelper(Application& app, uint64 offerId,
     }
     break;
     case MANAGE_OFFER_DELETED:
-        REQUIRE(!loadOffer(source.getPublicKey(), expectedOfferID, app, false));
-        break;
+    {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        REQUIRE(
+            !stellar::loadOffer(ltx, source.getPublicKey(), expectedOfferID));
+    }
+    break;
     default:
         abort();
     }
 
-    return manageOfferResult;
+    return manageSellOfferResult;
 }
 
-uint64_t
-applyManageOffer(Application& app, uint64 offerId, SecretKey const& source,
+int64_t
+applyManageOffer(Application& app, int64 offerId, SecretKey const& source,
                  Asset const& selling, Asset const& buying, Price const& price,
                  int64_t amount, SequenceNumber seq,
                  ManageOfferEffect expectedEffect)
 {
-    ManageOfferResult const& createOfferRes = applyCreateOfferHelper(
+    ManageSellOfferResult const& createOfferRes = applyCreateOfferHelper(
         app, offerId, source, selling, buying, price, amount, seq);
 
     auto& success = createOfferRes.success().offer;
@@ -666,14 +684,84 @@ applyManageOffer(Application& app, uint64 offerId, SecretKey const& source,
                                                     : 0;
 }
 
-uint64_t
+int64_t
+applyManageBuyOffer(Application& app, int64 offerId, SecretKey const& source,
+                    Asset const& selling, Asset const& buying,
+                    Price const& price, int64_t amount, SequenceNumber seq,
+                    ManageOfferEffect expectedEffect)
+{
+    auto getIdPool = [&]() {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        return ltx.loadHeader().current().idPool;
+    };
+    auto lastGeneratedID = getIdPool();
+    auto expectedOfferID = lastGeneratedID + 1;
+    if (offerId != 0)
+    {
+        expectedOfferID = offerId;
+    }
+
+    auto op = manageBuyOffer(offerId, selling, buying, price, amount);
+    auto tx = transactionFromOperations(app, source, seq, {op});
+
+    try
+    {
+        applyTx(tx, app);
+    }
+    catch (...)
+    {
+        REQUIRE(getIdPool() == lastGeneratedID);
+        throw;
+    }
+
+    auto& results = tx->getResult().result.results();
+    REQUIRE(results.size() == 1);
+    auto& manageBuyOfferResult = results[0].tr().manageBuyOfferResult();
+    auto& success = manageBuyOfferResult.success().offer;
+
+    REQUIRE(success.effect() == expectedEffect);
+    switch (success.effect())
+    {
+    case MANAGE_OFFER_CREATED:
+    case MANAGE_OFFER_UPDATED:
+    {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        auto offer =
+            stellar::loadOffer(ltx, source.getPublicKey(), expectedOfferID);
+        REQUIRE(offer);
+        auto& offerEntry = offer.current().data.offer();
+        REQUIRE(offerEntry == success.offer());
+        REQUIRE(offerEntry.price == Price{price.d, price.n});
+        REQUIRE(offerEntry.selling == selling);
+        REQUIRE(offerEntry.buying == buying);
+    }
+    break;
+    case MANAGE_OFFER_DELETED:
+    {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        REQUIRE(
+            !stellar::loadOffer(ltx, source.getPublicKey(), expectedOfferID));
+    }
+    break;
+    default:
+        abort();
+    }
+
+    return success.effect() != MANAGE_OFFER_DELETED ? success.offer().offerID
+                                                    : 0;
+}
+
+int64_t
 applyCreatePassiveOffer(Application& app, SecretKey const& source,
                         Asset const& selling, Asset const& buying,
                         Price const& price, int64_t amount, SequenceNumber seq,
                         ManageOfferEffect expectedEffect)
 {
-    auto lastGeneratedID =
-        app.getLedgerManager().getCurrentLedgerHeader().idPool;
+    auto getIdPool = [&]() {
+        LedgerTxn ltx(app.getLedgerTxnRoot());
+        return ltx.loadHeader().current().idPool;
+    };
+    auto lastGeneratedID = getIdPool();
     auto expectedOfferID = lastGeneratedID + 1;
 
     auto op = createPassiveOffer(selling, buying, price, amount);
@@ -685,8 +773,7 @@ applyCreatePassiveOffer(Application& app, SecretKey const& source,
     }
     catch (...)
     {
-        REQUIRE(app.getLedgerManager().getCurrentLedgerHeader().idPool ==
-                lastGeneratedID);
+        REQUIRE(getIdPool() == lastGeneratedID);
         throw;
     }
 
@@ -694,22 +781,23 @@ applyCreatePassiveOffer(Application& app, SecretKey const& source,
 
     REQUIRE(results.size() == 1);
 
-    auto& createPassiveOfferResult = results[0].tr().manageOfferResult();
+    auto& createPassiveSellOfferResult =
+        results[0].tr().manageSellOfferResult();
 
-    if (createPassiveOfferResult.code() == MANAGE_OFFER_SUCCESS)
+    if (createPassiveSellOfferResult.code() == MANAGE_SELL_OFFER_SUCCESS)
     {
-        OfferFrame::pointer offer;
-
-        auto& offerResult = createPassiveOfferResult.success().offer;
+        auto& offerResult = createPassiveSellOfferResult.success().offer;
 
         switch (offerResult.effect())
         {
         case MANAGE_OFFER_CREATED:
         case MANAGE_OFFER_UPDATED:
         {
-            offer =
-                loadOffer(source.getPublicKey(), expectedOfferID, app, true);
-            auto& offerEntry = offer->getOffer();
+            LedgerTxn ltx(app.getLedgerTxnRoot());
+            auto offer =
+                stellar::loadOffer(ltx, source.getPublicKey(), expectedOfferID);
+            REQUIRE(offer);
+            auto& offerEntry = offer.current().data.offer();
             REQUIRE(offerEntry == offerResult.offer());
             REQUIRE(offerEntry.price == price);
             REQUIRE(offerEntry.selling == selling);
@@ -718,15 +806,18 @@ applyCreatePassiveOffer(Application& app, SecretKey const& source,
         }
         break;
         case MANAGE_OFFER_DELETED:
-            REQUIRE(
-                !loadOffer(source.getPublicKey(), expectedOfferID, app, false));
-            break;
+        {
+            LedgerTxn ltx(app.getLedgerTxnRoot());
+            REQUIRE(!stellar::loadOffer(ltx, source.getPublicKey(),
+                                        expectedOfferID));
+        }
+        break;
         default:
             abort();
         }
     }
 
-    auto& success = createPassiveOfferResult.success().offer;
+    auto& success = createPassiveSellOfferResult.success().offer;
 
     REQUIRE(success.effect() == expectedEffect);
 

@@ -15,12 +15,56 @@
 namespace stellar
 {
 
+bool
+WrappedValuePtrComparator::operator()(ValueWrapperPtr const& l,
+                                      ValueWrapperPtr const& r) const
+{
+    assert(l && r);
+    return l->getValue() < r->getValue();
+}
+
+SCPEnvelopeWrapper::SCPEnvelopeWrapper(SCPEnvelope const& e) : mEnvelope(e)
+{
+}
+
+SCPEnvelopeWrapper::~SCPEnvelopeWrapper()
+{
+}
+
+ValueWrapper::ValueWrapper(Value const& value) : mValue(value)
+{
+}
+
+ValueWrapper::~ValueWrapper()
+{
+}
+
+SCPEnvelopeWrapperPtr
+SCPDriver::wrapEnvelope(SCPEnvelope const& envelope)
+{
+    auto res = std::make_shared<SCPEnvelopeWrapper>(envelope);
+    return res;
+}
+
+ValueWrapperPtr
+SCPDriver::wrapValue(Value const& value)
+{
+    auto res = std::make_shared<ValueWrapper>(value);
+    return res;
+}
+
 std::string
 SCPDriver::getValueString(Value const& v) const
 {
     uint256 valueHash = sha256(xdr::xdr_to_opaque(v));
 
     return hexAbbrev(valueHash);
+}
+
+std::string
+SCPDriver::toStrKey(PublicKey const& pk, bool fullKey) const
+{
+    return fullKey ? KeyUtils::toStrKey(pk) : toShortString(pk);
 }
 
 std::string

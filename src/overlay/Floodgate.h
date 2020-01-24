@@ -38,7 +38,7 @@ class Floodgate
 
         uint32_t mLedgerSeq;
         StellarMessage mMessage;
-        std::set<Peer::pointer> mPeersTold;
+        std::set<std::string> mPeersTold;
 
         FloodRecord(StellarMessage const& msg, uint32_t ledger,
                     Peer::pointer peer);
@@ -57,7 +57,9 @@ class Floodgate
     // returns true if this is a new record
     bool addRecord(StellarMessage const& msg, Peer::pointer fromPeer);
 
-    void broadcast(StellarMessage const& msg, bool force);
+    // only flood messages to peers that are at least minOverlayVersion
+    void broadcast(StellarMessage const& msg, bool force,
+                   uint32_t minOverlayVersion);
 
     // returns the list of peers that sent us the item with hash `h`
     std::set<Peer::pointer> getPeersKnows(Hash const& h);

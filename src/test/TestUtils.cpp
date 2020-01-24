@@ -3,19 +3,15 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "TestUtils.h"
-#include "overlay/LoopbackPeer.h"
+#include "overlay/test/LoopbackPeer.h"
+#include "test/test.h"
+#include "work/WorkScheduler.h"
 
 namespace stellar
 {
 
 namespace testutil
 {
-
-void
-setCurrentLedgerVersion(LedgerManager& lm, uint32_t currentLedgerVersion)
-{
-    lm.getCurrentLedgerHeader().ledgerVersion = currentLedgerVersion;
-}
 
 void
 crankSome(VirtualClock& clock)
@@ -29,6 +25,29 @@ crankSome(VirtualClock& clock)
 }
 
 void
+crankFor(VirtualClock& clock, VirtualClock::duration duration)
+{
+    auto start = clock.now();
+    while (clock.now() < (start + duration) && clock.crank(false) > 0)
+        ;
+}
+
+void
+shutdownWorkScheduler(Application& app)
+{
+    if (app.getClock().getIOContext().stopped())
+    {
+        throw std::runtime_error("Work scheduler attempted to shutdown after "
+                                 "VirtualClock io context stopped.");
+    }
+    app.getWorkScheduler().shutdown();
+    while (app.getWorkScheduler().getState() != BasicWork::State::WORK_ABORTED)
+    {
+        app.getClock().crank();
+    }
+}
+
+void
 injectSendPeersAndReschedule(VirtualClock::time_point& end, VirtualClock& clock,
                              VirtualTimer& timer,
                              LoopbackPeerConnection& connection)
@@ -37,12 +56,11 @@ injectSendPeersAndReschedule(VirtualClock::time_point& end, VirtualClock& clock,
     if (clock.now() < end && connection.getInitiator()->isConnected())
     {
         timer.expires_from_now(std::chrono::milliseconds(10));
-        timer.async_wait([&](asio::error_code const& ec) {
-            if (!ec)
-            {
+        timer.async_wait(
+            [&]() {
                 injectSendPeersAndReschedule(end, clock, timer, connection);
-            }
-        });
+            },
+            &VirtualTimer::onFailureNoop);
     }
 }
 

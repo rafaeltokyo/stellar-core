@@ -31,17 +31,15 @@ class CommandHandler
   public:
     CommandHandler(Application& app);
 
-    void manualCmd(std::string const& cmd);
+    std::string manualCmd(std::string const& cmd);
 
     void fileNotFound(std::string const& params, std::string& retStr);
 
     void bans(std::string const& params, std::string& retStr);
-    void catchup(std::string const& params, std::string& retStr);
     void checkdb(std::string const& params, std::string& retStr);
     void connect(std::string const& params, std::string& retStr);
     void dropcursor(std::string const& params, std::string& retStr);
     void dropPeer(std::string const& params, std::string& retStr);
-    void generateLoad(std::string const& params, std::string& retStr);
     void info(std::string const& params, std::string& retStr);
     void ll(std::string const& params, std::string& retStr);
     void logRotate(std::string const& params, std::string& retStr);
@@ -55,9 +53,16 @@ class CommandHandler
     void getcursor(std::string const& params, std::string& retStr);
     void scpInfo(std::string const& params, std::string& retStr);
     void tx(std::string const& params, std::string& retStr);
-    void testAcc(std::string const& params, std::string& retStr);
-    void testTx(std::string const& params, std::string& retStr);
     void unban(std::string const& params, std::string& retStr);
     void upgrades(std::string const& params, std::string& retStr);
+    void surveyTopology(std::string const&, std::string& retStr);
+    void stopSurvey(std::string const&, std::string& retStr);
+    void getSurveyResult(std::string const&, std::string& retStr);
+
+#ifdef BUILD_TESTS
+    void generateLoad(std::string const& params, std::string& retStr);
+    void testAcc(std::string const& params, std::string& retStr);
+    void testTx(std::string const& params, std::string& retStr);
+#endif
 };
 }

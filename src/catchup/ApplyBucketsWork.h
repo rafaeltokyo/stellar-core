@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "bucket/BucketApplicator.h"
 #include "work/Work.h"
 
 namespace medida
@@ -14,20 +15,28 @@ class Meter;
 namespace stellar
 {
 
-class BucketApplicator;
 class BucketLevel;
 class BucketList;
 class Bucket;
 struct HistoryArchiveState;
 struct LedgerHeaderHistoryEntry;
 
-class ApplyBucketsWork : public Work
+class ApplyBucketsWork : public BasicWork
 {
     std::map<std::string, std::shared_ptr<Bucket>> const& mBuckets;
-    const HistoryArchiveState& mApplyState;
+    HistoryArchiveState const& mApplyState;
+    bool mHaveCheckedApplyStateValidity{false};
 
-    bool mApplying;
-    uint32_t mLevel;
+    bool mApplying{false};
+    size_t mTotalBuckets{0};
+    size_t mAppliedBuckets{0};
+    size_t mAppliedEntries{0};
+    size_t mTotalSize{0};
+    size_t mAppliedSize{0};
+    size_t mLastAppliedSizeMb{0};
+    size_t mLastPos{0};
+    uint32_t mLevel{0};
+    uint32_t mMaxProtocolVersion{0};
     std::shared_ptr<Bucket const> mSnapBucket;
     std::shared_ptr<Bucket const> mCurrBucket;
     std::unique_ptr<BucketApplicator> mSnapApplicator;
@@ -36,22 +45,30 @@ class ApplyBucketsWork : public Work
     medida::Meter& mBucketApplyStart;
     medida::Meter& mBucketApplySuccess;
     medida::Meter& mBucketApplyFailure;
+    BucketApplicator::Counters mCounters;
 
+    void advance(std::string const& name, BucketApplicator& applicator);
     std::shared_ptr<Bucket const> getBucket(std::string const& bucketHash);
     BucketLevel& getBucketLevel(uint32_t level);
+    void startLevel();
+    bool isLevelComplete();
 
   public:
     ApplyBucketsWork(
-        Application& app, WorkParent& parent,
+        Application& app,
         std::map<std::string, std::shared_ptr<Bucket>> const& buckets,
-        HistoryArchiveState const& applyState);
-    ~ApplyBucketsWork();
+        HistoryArchiveState const& applyState, uint32_t maxProtocolVersion);
+    ~ApplyBucketsWork() = default;
 
+  protected:
     void onReset() override;
-    void onStart() override;
-    void onRun() override;
-    Work::State onSuccess() override;
-    void onFailureRetry() override;
+    BasicWork::State onRun() override;
+    bool
+    onAbort() override
+    {
+        return true;
+    };
     void onFailureRaise() override;
+    void onFailureRetry() override;
 };
 }

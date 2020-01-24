@@ -11,8 +11,7 @@
 namespace stellar
 {
 class Application;
-class LedgerDelta;
-class LedgerManager;
+struct LedgerTxnDelta;
 
 // This Invariant is used to validate that LedgerEntries meet a number of simple
 // requirements, such as bounds checking for a variety of fields. The Invariant
@@ -30,17 +29,18 @@ class LedgerEntryIsValid : public Invariant
     virtual std::string
     checkOnOperationApply(Operation const& operation,
                           OperationResult const& result,
-                          LedgerDelta const& delta) override;
+                          LedgerTxnDelta const& ltxDelta) override;
 
   private:
     template <typename IterType>
-    std::string check(IterType iter, IterType const& end,
-                      uint32_t ledgerSeq) const;
+    std::string check(IterType iter, IterType const& end, uint32_t ledgerSeq,
+                      uint32 version) const;
 
-    std::string checkIsValid(LedgerEntry const& le, uint32_t ledgerSeq) const;
-    std::string checkIsValid(AccountEntry const& ae) const;
-    std::string checkIsValid(TrustLineEntry const& tl) const;
-    std::string checkIsValid(OfferEntry const& oe) const;
-    std::string checkIsValid(DataEntry const& de) const;
+    std::string checkIsValid(LedgerEntry const& le, uint32_t ledgerSeq,
+                             uint32 version) const;
+    std::string checkIsValid(AccountEntry const& ae, uint32 version) const;
+    std::string checkIsValid(TrustLineEntry const& tl, uint32 version) const;
+    std::string checkIsValid(OfferEntry const& oe, uint32 version) const;
+    std::string checkIsValid(DataEntry const& de, uint32 version) const;
 };
 }

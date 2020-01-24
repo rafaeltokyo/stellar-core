@@ -5,14 +5,21 @@
 #include "util/Fs.h"
 #include "crypto/Hex.h"
 #include "lib/util/format.h"
+#include "util/FileSystemException.h"
 #include "util/Logging.h"
+
 #include <map>
 #include <regex>
 #include <sstream>
 
 #ifdef _WIN32
 #include <direct.h>
-#include <filesystem>
+
+// Latest version of VC++ complains without this define (confused by C++ 17)
+#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING 1
+#include <experimental/filesystem>
+
+#include <io.h>
 #else
 #include <dirent.h>
 #include <sys/resource.h>
@@ -54,7 +61,7 @@ lockFile(std::string const& path)
     {
         // not sure if there is more verbose info that can be obtained here
         errmsg << "unable to create lock file: " << path;
-        throw std::runtime_error(errmsg.str());
+        throw FileSystemException(errmsg.str());
     }
 
     lockMap.insert(std::make_pair(path, h));
@@ -75,6 +82,40 @@ unlockFile(std::string const& path)
     }
 }
 
+void
+flushFileChanges(FILE* fp)
+{
+    int fd = _fileno(fp);
+    if (fd == -1)
+    {
+        FileSystemException::failWithErrno(
+            "fs::flushFileChanges() failed on _fileno(): ");
+    }
+    HANDLE fh = (HANDLE)_get_osfhandle(fd);
+    if (fh == INVALID_HANDLE_VALUE)
+    {
+        FileSystemException::failWithErrno(
+            "fs::flushFileChanges() failed on _get_osfhandle(): ");
+    }
+    if (FlushFileBuffers(fh) == FALSE)
+    {
+        FileSystemException::failWithGetLastError(
+            "fs::flushFileChanges() failed on _get_osfhandle(): ");
+    }
+}
+
+bool
+durableRename(std::string const& src, std::string const& dst,
+              std::string const& dir)
+{
+    if (MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_WRITE_THROUGH) == 0)
+    {
+        FileSystemException::failWithGetLastError(
+            "fs::durableRename() failed on MoveFileExA(): ");
+    }
+    return true;
+}
+
 bool
 exists(std::string const& name)
 {
@@ -91,7 +132,7 @@ exists(std::string const& name)
         else
         {
             std::string msg("error accessing path: ");
-            throw std::runtime_error(msg + name);
+            throw FileSystemException(msg + name);
         }
     }
     return true;
@@ -117,7 +158,7 @@ deltree(std::string const& d)
     s.fFlags = FOF_NO_UI;
     if (SHFileOperation(&s) != 0)
     {
-        throw std::runtime_error("SHFileOperation failed in deltree");
+        throw FileSystemException("SHFileOperation failed in deltree");
     }
 }
 
@@ -141,36 +182,6 @@ findfiles(std::string const& p,
         }
     }
     return res;
-}
-
-long
-getCurrentPid()
-{
-    return static_cast<long>(GetCurrentProcessId());
-}
-
-bool
-processExists(long pid)
-{
-    std::vector<DWORD> buffer(4096);
-    DWORD bytesWritten;
-    for (;;)
-    {
-        if (!EnumProcesses(buffer.data(),
-                           static_cast<DWORD>(buffer.size() * sizeof(DWORD)),
-                           &bytesWritten))
-        {
-            throw std::runtime_error("EnumProcess failed");
-        }
-        if (bytesWritten / sizeof(DWORD) < buffer.size())
-        {
-            auto found = std::find(buffer.begin(), buffer.end(),
-                                   static_cast<DWORD>(pid));
-            return !(found == buffer.end());
-        }
-        // Need a larger buffer to hold all the ids.
-        buffer.resize(buffer.size() * 2);
-    }
 }
 
 #else
@@ -200,7 +211,7 @@ lockFile(std::string const& path)
     {
         errmsg << "unable to open lock file: " << path << " ("
                << strerror(errno) << ")";
-        throw std::runtime_error(errmsg.str());
+        throw FileSystemException(errmsg.str());
     }
 
     int r = flock(fd, LOCK_EX | LOCK_NB);
@@ -209,7 +220,7 @@ lockFile(std::string const& path)
         close(fd);
         errmsg << "unable to flock file: " << path << " (" << strerror(errno)
                << ")";
-        throw std::runtime_error(errmsg.str());
+        throw FileSystemException(errmsg.str());
     }
 
     lockMap.insert(std::make_pair(path, fd));
@@ -231,6 +242,49 @@ unlockFile(std::string const& path)
     }
 }
 
+void
+flushFileChanges(FILE* fp)
+{
+    int fd = fileno(fp);
+    if (fd == -1)
+    {
+        FileSystemException::failWithErrno(
+            "fs::flushFileChanges() failed on fileno(): ");
+    }
+    if (fsync(fd) == -1)
+    {
+        FileSystemException::failWithErrno(
+            "fs::flushFileChanges() failed on fsync(): ");
+    }
+}
+
+bool
+durableRename(std::string const& src, std::string const& dst,
+              std::string const& dir)
+{
+    if (rename(src.c_str(), dst.c_str()) != 0)
+    {
+        return false;
+    }
+    auto dfd = open(dir.c_str(), O_RDONLY);
+    if (dfd == -1)
+    {
+        FileSystemException::failWithErrno(
+            std::string("Failed to open directory ") + dir + " :");
+    }
+    if (fsync(dfd) == -1)
+    {
+        FileSystemException::failWithErrno(
+            std::string("Failed to fsync directory ") + dir + " :");
+    }
+    if (close(dfd) == -1)
+    {
+        FileSystemException::failWithErrno(
+            std::string("Failed to close directory ") + dir + " :");
+    }
+    return true;
+}
+
 bool
 exists(std::string const& name)
 {
@@ -244,7 +298,7 @@ exists(std::string const& name)
         else
         {
             std::string msg("error accessing path: ");
-            throw std::runtime_error(msg + name);
+            throw FileSystemException(msg + name);
         }
     }
     return true;
@@ -270,16 +324,16 @@ nftw_deltree_callback(char const* name, struct stat const* st, int flag,
     {
         if (rmdir(name) != 0)
         {
-            throw std::runtime_error(std::string{"rmdir of "} + name +
-                                     " failed");
+            throw FileSystemException(std::string{"rmdir of "} + name +
+                                      " failed");
         }
     }
     else
     {
         if (std::remove(name) != 0)
         {
-            throw std::runtime_error(std::string{"std::remove of "} + name +
-                                     " failed");
+            throw FileSystemException(std::string{"std::remove of "} + name +
+                                      " failed");
         }
     }
     return 0;
@@ -291,7 +345,7 @@ deltree(std::string const& d)
 {
     if (nftw(d.c_str(), nftw_deltree_callback, FOPEN_MAX, FTW_DEPTH) != 0)
     {
-        throw std::runtime_error("nftw failed in deltree for " + d);
+        throw FileSystemException("nftw failed in deltree for " + d);
     }
 }
 
@@ -326,18 +380,6 @@ findfiles(std::string const& path,
         closedir(dir);
         throw;
     }
-}
-
-long
-getCurrentPid()
-{
-    return static_cast<long>(getpid());
-}
-
-bool
-processExists(long pid)
-{
-    return (kill(pid, 0) == 0);
 }
 
 #endif
@@ -392,7 +434,8 @@ hexStr(uint32_t checkpointNum)
 std::string
 hexDir(std::string const& hexStr)
 {
-    std::regex rx("([[:xdigit:]]{2})([[:xdigit:]]{2})([[:xdigit:]]{2}).*");
+    static const std::regex rx(
+        "([[:xdigit:]]{2})([[:xdigit:]]{2})([[:xdigit:]]{2}).*");
     std::smatch sm;
     bool matched = std::regex_match(hexStr, sm, rx);
     assert(matched);
@@ -423,7 +466,7 @@ remoteName(std::string const& type, std::string const& hexStr,
 void
 checkGzipSuffix(std::string const& filename)
 {
-    std::string suf(".gz");
+    static const std::string suf(".gz");
     if (!(filename.size() >= suf.size() &&
           equal(suf.rbegin(), suf.rend(), filename.rbegin())))
     {
@@ -434,11 +477,38 @@ checkGzipSuffix(std::string const& filename)
 void
 checkNoGzipSuffix(std::string const& filename)
 {
-    std::string suf(".gz");
+    static const std::string suf(".gz");
     if (filename.size() >= suf.size() &&
         equal(suf.rbegin(), suf.rend(), filename.rbegin()))
     {
         throw std::runtime_error("filename ends in .gz");
+    }
+}
+
+size_t
+size(std::ifstream& ifs)
+{
+    assert(ifs.is_open());
+
+    ifs.seekg(0, ifs.end);
+    auto result = ifs.tellg();
+    ifs.seekg(0, ifs.beg);
+
+    return std::max(decltype(result){0}, result);
+}
+
+size_t
+size(std::string const& filename)
+{
+    std::ifstream ifs;
+    ifs.open(filename, std::ifstream::binary);
+    if (ifs)
+    {
+        return size(ifs);
+    }
+    else
+    {
+        return 0;
     }
 }
 

@@ -3,500 +3,510 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "catchup/CatchupWork.h"
+#include "bucket/BucketList.h"
 #include "catchup/ApplyBucketsWork.h"
-#include "catchup/ApplyLedgerChainWork.h"
+#include "catchup/ApplyBufferedLedgersWork.h"
+#include "catchup/ApplyCheckpointWork.h"
 #include "catchup/CatchupConfiguration.h"
-#include "catchup/DownloadBucketsWork.h"
+#include "catchup/DownloadApplyTxsWork.h"
 #include "catchup/VerifyLedgerChainWork.h"
 #include "history/FileTransferInfo.h"
 #include "history/HistoryManager.h"
 #include "historywork/BatchDownloadWork.h"
+#include "historywork/DownloadBucketsWork.h"
+#include "historywork/DownloadVerifyTxResultsWork.h"
 #include "historywork/GetAndUnzipRemoteFileWork.h"
 #include "historywork/GetHistoryArchiveStateWork.h"
 #include "historywork/VerifyBucketWork.h"
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
-#include "test/TestPrinter.h"
 #include "util/Logging.h"
 #include <lib/util/format.h>
 
 namespace stellar
 {
 
-CatchupWork::CatchupWork(Application& app, WorkParent& parent,
+uint32_t const CatchupWork::PUBLISH_QUEUE_UNBLOCK_APPLICATION = 16;
+uint32_t const CatchupWork::PUBLISH_QUEUE_MAX_SIZE = 32;
+
+CatchupWork::CatchupWork(Application& app,
                          CatchupConfiguration catchupConfiguration,
-                         bool manualCatchup, ProgressHandler progressHandler,
-                         size_t maxRetries)
-    : BucketDownloadWork(
-          app, parent, "catchup",
-          app.getHistoryManager().getLastClosedHistoryArchiveState(),
-          maxRetries)
+                         ProgressHandler progressHandler,
+                         std::shared_ptr<HistoryArchive> archive)
+    : Work(app, "catchup", BasicWork::RETRY_NEVER)
+    , mLocalState{app.getLedgerManager().getLastClosedLedgerHAS()}
+    , mDownloadDir{std::make_unique<TmpDir>(
+          mApp.getTmpDirManager().tmpDir(getName()))}
     , mCatchupConfiguration{catchupConfiguration}
-    , mManualCatchup{manualCatchup}
     , mProgressHandler{progressHandler}
+    , mArchive{archive}
 {
+    if (mArchive)
+    {
+        CLOG(INFO, "History")
+            << "CatchupWork: selected archive " << mArchive->getName();
+    }
 }
 
 CatchupWork::~CatchupWork()
 {
-    clearChildren();
 }
 
 std::string
 CatchupWork::getStatus() const
 {
-    if (mState == WORK_PENDING)
+    if (mCatchupSeq)
     {
-        if (mApplyTransactionsWork)
-        {
-            return mApplyTransactionsWork->getStatus();
-        }
-        else if (mDownloadTransactionsWork)
-        {
-            return mDownloadTransactionsWork->getStatus();
-        }
-        else if (mApplyBucketsWork)
-        {
-            return mApplyBucketsWork->getStatus();
-        }
-        else if (mDownloadBucketsWork)
-        {
-            return mDownloadBucketsWork->getStatus();
-        }
-        else if (mGetBucketsHistoryArchiveStateWork)
-        {
-            return mGetBucketsHistoryArchiveStateWork->getStatus();
-        }
-        else if (mVerifyLedgersWork)
-        {
-            return mVerifyLedgersWork->getStatus();
-        }
-        else if (mDownloadLedgersWork)
-        {
-            return mDownloadLedgersWork->getStatus();
-        }
-        else if (mGetHistoryArchiveStateWork)
-        {
-            return mGetHistoryArchiveStateWork->getStatus();
-        }
+        return mCatchupSeq->getStatus();
     }
-    return BucketDownloadWork::getStatus();
+    return Work::getStatus();
 }
 
 void
-CatchupWork::onReset()
+CatchupWork::doReset()
 {
-    auto toLedger = mCatchupConfiguration.toLedger() == 0
-                        ? "CURRENT"
-                        : std::to_string(mCatchupConfiguration.toLedger());
-    CLOG(INFO, "History") << "Starting catchup with configuration:\n"
-                          << "  lastClosedLedger: "
-                          << mApp.getLedgerManager().getLastClosedLedgerNum()
-                          << "\n"
-                          << "  toLedger: " << toLedger << "\n"
-                          << "  count: " << mCatchupConfiguration.count();
-
-    auto toCheckpoint =
-        mCatchupConfiguration.toLedger() == CatchupConfiguration::CURRENT
-            ? CatchupConfiguration::CURRENT
-            : mApp.getHistoryManager().nextCheckpointLedger(
-                  mCatchupConfiguration.toLedger() + 1) -
-                  1;
-    CLOG(INFO, "History")
-        << "Catchup downloading history archive state at checkpoint "
-        << toCheckpoint;
-
-    clearChildren();
     mBucketsAppliedEmitted = false;
-    BucketDownloadWork::onReset();
+    mTransactionsVerifyEmitted = false;
+    mBuckets.clear();
+    mDownloadVerifyLedgersSeq.reset();
+    mBucketVerifyApplySeq.reset();
+    mTransactionsVerifyApplySeq.reset();
     mGetHistoryArchiveStateWork.reset();
-    mDownloadLedgersWork.reset();
-    mVerifyLedgersWork.reset();
-    mGetBucketsHistoryArchiveStateWork.reset();
-    mDownloadBucketsWork.reset();
-    mApplyBucketsWork.reset();
-    mDownloadTransactionsWork.reset();
-    mApplyTransactionsWork.reset();
-
-    mLastClosedLedgerAtReset = mApp.getLedgerManager().getLastClosedLedgerNum();
-    mGetHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(
-        "get-history-archive-state", mRemoteState, toCheckpoint);
+    mApplyBufferedLedgersWork.reset();
+    auto const& lcl = mApp.getLedgerManager().getLastClosedLedgerHeader();
+    mLastClosedLedgerHashPair =
+        LedgerNumHashPair(lcl.header.ledgerSeq, make_optional<Hash>(lcl.hash));
+    mCatchupSeq.reset();
+    mGetBucketStateWork.reset();
+    mVerifyTxResults.reset();
+    mVerifyLedgers.reset();
+    mLastApplied = mApp.getLedgerManager().getLastClosedLedgerHeader();
 }
 
 bool
 CatchupWork::hasAnyLedgersToCatchupTo() const
 {
     assert(mGetHistoryArchiveStateWork);
-    assert(mGetHistoryArchiveStateWork->getState() == WORK_SUCCESS);
+    assert(mGetHistoryArchiveStateWork->getState() == State::WORK_SUCCESS);
 
-    if (mLastClosedLedgerAtReset <= mRemoteState.currentLedger)
-    {
-        return true;
-    }
-
-    CLOG(INFO, "History")
-        << "Last closed ledger is later than current checkpoint: "
-        << mLastClosedLedgerAtReset << " > " << mRemoteState.currentLedger;
-    CLOG(INFO, "History") << "Wait until next checkpoint before retrying ";
-    CLOG(ERROR, "History") << "Nothing to catchup to ";
-    return false;
+    return mLastClosedLedgerHashPair.first <=
+           mGetHistoryArchiveStateWork->getHistoryArchiveState().currentLedger;
 }
 
-bool
-CatchupWork::downloadLedgers(CheckpointRange const& range)
+void
+CatchupWork::downloadVerifyLedgerChain(CatchupRange const& catchupRange,
+                                       LedgerNumHashPair rangeEnd)
 {
-    if (mDownloadLedgersWork)
-    {
-        assert(mDownloadLedgersWork->getState() == WORK_SUCCESS);
-        return false;
-    }
+    auto verifyRange = LedgerRange{catchupRange.mApplyBuckets
+                                       ? catchupRange.getBucketApplyLedger()
+                                       : catchupRange.mLedgers.mFirst,
+                                   catchupRange.getLast()};
+    auto checkpointRange =
+        CheckpointRange{verifyRange, mApp.getHistoryManager()};
+    auto getLedgers = std::make_shared<BatchDownloadWork>(
+        mApp, checkpointRange, HISTORY_FILE_TYPE_LEDGER, *mDownloadDir,
+        mArchive);
+    mVerifyLedgers = std::make_shared<VerifyLedgerChainWork>(
+        mApp, *mDownloadDir, verifyRange, mLastClosedLedgerHashPair, rangeEnd);
 
-    CLOG(INFO, "History")
-        << "Catchup downloading ledger chain for checkpointRange ["
-        << range.first() << ".." << range.last() << "]";
-    mDownloadLedgersWork = addWork<BatchDownloadWork>(
-        range, HISTORY_FILE_TYPE_LEDGER, *mDownloadDir);
-
-    return true;
+    std::vector<std::shared_ptr<BasicWork>> seq{getLedgers, mVerifyLedgers};
+    mDownloadVerifyLedgersSeq =
+        addWork<WorkSequence>("download-verify-ledgers-seq", seq);
 }
 
-bool
-CatchupWork::verifyLedgers(LedgerRange const& range)
+void
+CatchupWork::downloadVerifyTxResults(CatchupRange const& catchupRange)
 {
-    if (mVerifyLedgersWork)
-    {
-        assert(mVerifyLedgersWork->getState() == WORK_SUCCESS);
-        return false;
-    }
-
-    CLOG(INFO, "History")
-        << "Catchup verifying ledger chain for checkpointRange ["
-        << range.first() << ".." << range.last() << "]";
-    mVerifyLedgersWork = addWork<VerifyLedgerChainWork>(
-        *mDownloadDir, range, mManualCatchup, mFirstVerified, mLastVerified);
-
-    return true;
+    auto range =
+        LedgerRange{catchupRange.mLedgers.mFirst, catchupRange.getLast()};
+    auto checkpointRange = CheckpointRange{range, mApp.getHistoryManager()};
+    mVerifyTxResults = std::make_shared<DownloadVerifyTxResultsWork>(
+        mApp, checkpointRange, *mDownloadDir);
 }
 
 bool
 CatchupWork::alreadyHaveBucketsHistoryArchiveState(uint32_t atCheckpoint) const
 {
-    return atCheckpoint == mRemoteState.currentLedger;
+    return atCheckpoint ==
+           mGetHistoryArchiveStateWork->getHistoryArchiveState().currentLedger;
 }
 
-bool
-CatchupWork::downloadBucketsHistoryArchiveState(uint32_t atCheckpoint)
+WorkSeqPtr
+CatchupWork::downloadApplyBuckets()
 {
-    if (mGetBucketsHistoryArchiveStateWork)
-    {
-        assert(mGetBucketsHistoryArchiveStateWork->getState() == WORK_SUCCESS);
-        return false;
-    }
+    auto const& has = mGetBucketStateWork->getHistoryArchiveState();
+    std::vector<std::string> hashes = has.differingBuckets(mLocalState);
+    auto getBuckets = std::make_shared<DownloadBucketsWork>(
+        mApp, mBuckets, hashes, *mDownloadDir, mArchive);
 
-    CLOG(INFO, "History") << "Catchup downloading history archive "
-                             "state for applying buckets at checkpoint "
-                          << atCheckpoint;
+    auto applyBuckets = std::make_shared<ApplyBucketsWork>(
+        mApp, mBuckets, has, mVerifiedLedgerRangeStart.header.ledgerVersion);
 
-    mGetBucketsHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(
-        "get-buckets-history-archive-state", mApplyBucketsRemoteState,
-        atCheckpoint);
-
-    return true;
+    std::vector<std::shared_ptr<BasicWork>> seq{getBuckets, applyBuckets};
+    return std::make_shared<WorkSequence>(mApp, "download-verify-apply-buckets",
+                                          seq, RETRY_NEVER);
 }
 
-bool
-CatchupWork::downloadBuckets()
+void
+CatchupWork::assertBucketState()
 {
-    if (mDownloadBucketsWork)
-    {
-        assert(mDownloadBucketsWork->getState() == WORK_SUCCESS);
-        return false;
-    }
+    auto const& has = mGetBucketStateWork->getHistoryArchiveState();
 
-    CLOG(INFO, "History") << "Catchup downloading and verifying buckets";
-    std::vector<std::string> hashes =
-        mApplyBucketsRemoteState.differingBuckets(mLocalState);
-    mDownloadBucketsWork =
-        addWork<DownloadBucketsWork>(mBuckets, hashes, *mDownloadDir);
-    return true;
-}
+    // Consistency check: remote state and mVerifiedLedgerRangeStart should
+    // point to the same ledger and the same BucketList.
+    assert(has.currentLedger == mVerifiedLedgerRangeStart.header.ledgerSeq);
+    assert(has.getBucketListHash() ==
+           mVerifiedLedgerRangeStart.header.bucketListHash);
 
-bool
-CatchupWork::applyBuckets()
-{
-    if (mApplyBucketsWork)
-    {
-        assert(mApplyBucketsWork->getState() == WORK_SUCCESS);
-        return false;
-    }
-
-    // Consistency check: mRemoteState and mFirstVerified should point to
-    // the same ledger and the same BucketList.
-    assert(mApplyBucketsRemoteState.currentLedger ==
-           mFirstVerified.header.ledgerSeq);
-    assert(mApplyBucketsRemoteState.getBucketListHash() ==
-           mFirstVerified.header.bucketListHash);
-
-    // Consistency check: LCL should be in the _past_ from firstVerified,
-    // since we're about to clobber a bunch of DB state with new buckets
-    // held in firstVerified's state.
-    auto lcl = app().getLedgerManager().getLastClosedLedgerHeader();
-    if (mFirstVerified.header.ledgerSeq < lcl.header.ledgerSeq)
+    // Consistency check: LCL should be in the _past_ from
+    // firstVerified, since we're about to clobber a bunch of DB
+    // state with new buckets held in firstVerified's state.
+    auto lcl = mApp.getLedgerManager().getLastClosedLedgerHeader();
+    if (mVerifiedLedgerRangeStart.header.ledgerSeq < lcl.header.ledgerSeq)
     {
         throw std::runtime_error(
             fmt::format("Catchup MINIMAL applying ledger earlier than local "
                         "LCL: {:s} < {:s}",
-                        LedgerManager::ledgerAbbrev(mFirstVerified),
+                        LedgerManager::ledgerAbbrev(mVerifiedLedgerRangeStart),
                         LedgerManager::ledgerAbbrev(lcl)));
     }
-
-    CLOG(INFO, "History") << "Catchup applying buckets for state "
-                          << LedgerManager::ledgerAbbrev(mFirstVerified);
-    mApplyBucketsWork =
-        addWork<ApplyBucketsWork>(mBuckets, mApplyBucketsRemoteState);
-
-    return true;
 }
 
-bool
-CatchupWork::downloadTransactions(CheckpointRange const& range)
+void
+CatchupWork::downloadApplyTransactions(CatchupRange const& catchupRange)
 {
-    if (mDownloadTransactionsWork)
+    auto waitForPublish = mCatchupConfiguration.offline();
+    auto range =
+        LedgerRange{catchupRange.mLedgers.mFirst, catchupRange.getLast()};
+    mTransactionsVerifyApplySeq = std::make_shared<DownloadApplyTxsWork>(
+        mApp, *mDownloadDir, range, mLastApplied, waitForPublish, mArchive);
+}
+
+BasicWork::State
+CatchupWork::runCatchupStep()
+{
+    // Step 1: Get history archive state
+    if (!mGetHistoryArchiveStateWork)
     {
-        assert(mDownloadTransactionsWork->getState() == WORK_SUCCESS);
-        return false;
+        auto toLedger = mCatchupConfiguration.toLedger() == 0
+                            ? "CURRENT"
+                            : std::to_string(mCatchupConfiguration.toLedger());
+        CLOG(INFO, "History")
+            << "Starting catchup with configuration:\n"
+            << "  lastClosedLedger: "
+            << mApp.getLedgerManager().getLastClosedLedgerNum() << "\n"
+            << "  toLedger: " << toLedger << "\n"
+            << "  count: " << mCatchupConfiguration.count();
+
+        auto toCheckpoint =
+            mCatchupConfiguration.toLedger() == CatchupConfiguration::CURRENT
+                ? CatchupConfiguration::CURRENT
+                : mApp.getHistoryManager().nextCheckpointLedger(
+                      mCatchupConfiguration.toLedger() + 1) -
+                      1;
+        mGetHistoryArchiveStateWork =
+            addWork<GetHistoryArchiveStateWork>(toCheckpoint, mArchive);
+        return State::WORK_RUNNING;
+    }
+    else if (mGetHistoryArchiveStateWork->getState() != State::WORK_SUCCESS)
+    {
+        return mGetHistoryArchiveStateWork->getState();
     }
 
-    CLOG(INFO, "History") << "Catchup downloading transactions for range ["
-                          << range.first() << ".." << range.last() << "]";
-
-    mDownloadTransactionsWork = addWork<BatchDownloadWork>(
-        range, HISTORY_FILE_TYPE_TRANSACTIONS, *mDownloadDir);
-
-    return true;
-}
-
-bool
-CatchupWork::applyTransactions(LedgerRange const& range)
-{
-    if (mApplyTransactionsWork)
-    {
-        assert(mApplyTransactionsWork->getState() == WORK_SUCCESS);
-        return false;
-    }
-
-    CLOG(INFO, "History") << "Catchup applying transactions for range ["
-                          << range.first() << ".." << range.last() << "]";
-
-    mApplyTransactionsWork =
-        addWork<ApplyLedgerChainWork>(*mDownloadDir, range, mLastApplied);
-
-    return true;
-}
-
-Work::State
-CatchupWork::onSuccess()
-{
+    auto const& has = mGetHistoryArchiveStateWork->getHistoryArchiveState();
+    // Step 2: Compare local and remote states
     if (!hasAnyLedgersToCatchupTo())
     {
-        mApp.getCatchupManager().historyCaughtup();
-        asio::error_code ec = std::make_error_code(std::errc::invalid_argument);
-        mProgressHandler(ec, ProgressState::FINISHED,
-                         LedgerHeaderHistoryEntry{});
-        return WORK_SUCCESS;
+        CLOG(INFO, "History") << "*";
+        CLOG(INFO, "History")
+            << "* Target ledger " << has.currentLedger
+            << " is not newer than last closed ledger "
+            << mLastClosedLedgerHashPair.first << " - nothing to do";
+
+        if (mCatchupConfiguration.toLedger() == CatchupConfiguration::CURRENT)
+        {
+            CLOG(INFO, "History")
+                << "* Wait until next checkpoint before retrying";
+        }
+        else
+        {
+            CLOG(INFO, "History") << "* If you really want to catchup to "
+                                  << mCatchupConfiguration.toLedger()
+                                  << " run stellar-core new-db";
+        }
+
+        CLOG(INFO, "History") << "*";
+
+        CLOG(ERROR, "History") << "Nothing to catchup to ";
+
+        return State::WORK_FAILURE;
     }
 
     auto resolvedConfiguration =
-        mCatchupConfiguration.resolve(mRemoteState.currentLedger);
+        mCatchupConfiguration.resolve(has.currentLedger);
     auto catchupRange =
-        makeCatchupRange(mLastClosedLedgerAtReset, resolvedConfiguration,
-                         mApp.getHistoryManager());
-    auto ledgerRange = catchupRange.first;
-    auto checkpointRange =
-        CheckpointRange{ledgerRange, mApp.getHistoryManager()};
+        CatchupRange{mLastClosedLedgerHashPair.first, resolvedConfiguration,
+                     mApp.getHistoryManager()};
 
-    if (downloadLedgers(checkpointRange))
+    // Step 3: If needed, download archive state for buckets
+    if (catchupRange.mApplyBuckets)
     {
-        return WORK_PENDING;
-    }
-
-    if (verifyLedgers(ledgerRange))
-    {
-        return WORK_PENDING;
-    }
-
-    if (catchupRange.second)
-    {
-        if (!alreadyHaveBucketsHistoryArchiveState(checkpointRange.first()))
+        auto applyBucketsAt = catchupRange.getBucketApplyLedger();
+        if (!alreadyHaveBucketsHistoryArchiveState(applyBucketsAt))
         {
-            if (downloadBucketsHistoryArchiveState(checkpointRange.first()))
+            if (!mGetBucketStateWork)
             {
-                return WORK_PENDING;
+                mGetBucketStateWork = addWork<GetHistoryArchiveStateWork>(
+                    applyBucketsAt, mArchive);
+            }
+            if (mGetBucketStateWork->getState() != State::WORK_SUCCESS)
+            {
+                return mGetBucketStateWork->getState();
             }
         }
         else
         {
-            mApplyBucketsRemoteState = mRemoteState;
-        }
-
-        if (downloadBuckets())
-        {
-            return WORK_PENDING;
-        }
-
-        if (applyBuckets())
-        {
-            return WORK_PENDING;
-        }
-
-        if (!mBucketsAppliedEmitted)
-        {
-            mProgressHandler({}, ProgressState::APPLIED_BUCKETS,
-                             mFirstVerified);
-            mBucketsAppliedEmitted = true;
+            mGetBucketStateWork = mGetHistoryArchiveStateWork;
         }
     }
-    else
+
+    // Step 4: Download, verify and apply ledgers, buckets and transactions
+
+    // Bucket and transaction processing has started
+    if (mCatchupSeq)
     {
-        CLOG(INFO, "History") << "Catchup downloading history archive "
-                                 "state for applying buckets at checkpoint "
-                              << checkpointRange.first() << " not needed";
-    }
+        assert(mDownloadVerifyLedgersSeq);
+        assert(mTransactionsVerifyApplySeq || !catchupRange.applyLedgers());
 
-    if (downloadTransactions(checkpointRange))
+        if (mCatchupSeq->getState() == State::WORK_SUCCESS)
+        {
+            // Step 4.4: Apply buffered ledgers
+            if (mApplyBufferedLedgersWork)
+            {
+                if (mApplyBufferedLedgersWork->getState() ==
+                    State::WORK_SUCCESS)
+                {
+                    mApplyBufferedLedgersWork.reset();
+                }
+                else
+                {
+                    // waiting for mApplyBufferedLedgersWork to complete/error
+                    // out
+                    return mApplyBufferedLedgersWork->getState();
+                }
+            }
+            // see if we need to apply buffered ledgers
+            if (mApp.getLedgerManager().hasBufferedLedger())
+            {
+                mApplyBufferedLedgersWork = addWork<ApplyBufferedLedgersWork>();
+                return State::WORK_RUNNING;
+            }
+
+            return State::WORK_SUCCESS;
+        }
+        else if (mBucketVerifyApplySeq)
+        {
+            if (mBucketVerifyApplySeq->getState() == State::WORK_SUCCESS &&
+                !mBucketsAppliedEmitted)
+            {
+                mProgressHandler(ProgressState::APPLIED_BUCKETS,
+                                 mVerifiedLedgerRangeStart,
+                                 mCatchupConfiguration.mode());
+                mBucketsAppliedEmitted = true;
+                mBuckets.clear();
+                mLastApplied =
+                    mApp.getLedgerManager().getLastClosedLedgerHeader();
+            }
+        }
+        else if (mTransactionsVerifyApplySeq)
+        {
+            if (mTransactionsVerifyApplySeq->getState() ==
+                    State::WORK_SUCCESS &&
+                !mTransactionsVerifyEmitted)
+            {
+                mTransactionsVerifyEmitted = true;
+                mProgressHandler(ProgressState::APPLIED_TRANSACTIONS,
+                                 mLastApplied, mCatchupConfiguration.mode());
+            }
+        }
+        return mCatchupSeq->getState();
+    }
+    // Still waiting for ledger headers
+    else if (mDownloadVerifyLedgersSeq)
     {
-        return WORK_PENDING;
+        if (mDownloadVerifyLedgersSeq->getState() == State::WORK_SUCCESS)
+        {
+            mVerifiedLedgerRangeStart =
+                mVerifyLedgers->getVerifiedLedgerRangeStart();
+            if (catchupRange.mApplyBuckets && !mBucketsAppliedEmitted)
+            {
+                assertBucketState();
+            }
+
+            std::vector<std::shared_ptr<BasicWork>> seq;
+            if (mCatchupConfiguration.mode() ==
+                CatchupConfiguration::Mode::OFFLINE_COMPLETE)
+            {
+                downloadVerifyTxResults(catchupRange);
+                seq.push_back(mVerifyTxResults);
+            }
+
+            if (catchupRange.mApplyBuckets)
+            {
+                // Step 4.2: Download, verify and apply buckets
+                mBucketVerifyApplySeq = downloadApplyBuckets();
+                seq.push_back(mBucketVerifyApplySeq);
+            }
+
+            if (catchupRange.applyLedgers())
+            {
+                // Step 4.3: Download and apply ledger chain
+                downloadApplyTransactions(catchupRange);
+                seq.push_back(mTransactionsVerifyApplySeq);
+            }
+
+            mCatchupSeq =
+                addWork<WorkSequence>("catchup-seq", seq, RETRY_NEVER);
+            return State::WORK_RUNNING;
+        }
+        return mDownloadVerifyLedgersSeq->getState();
     }
 
-    if (applyTransactions(ledgerRange))
-    {
-        return WORK_PENDING;
-    }
+    // Step 4.1: Download and verify ledger chain
+    downloadVerifyLedgerChain(catchupRange,
+                              LedgerNumHashPair(catchupRange.getLast(),
+                                                mCatchupConfiguration.hash()));
 
-    mProgressHandler({}, ProgressState::APPLIED_TRANSACTIONS, mLastApplied);
-    mProgressHandler({}, ProgressState::FINISHED, mLastApplied);
-    mApp.getCatchupManager().historyCaughtup();
-    return WORK_SUCCESS;
+    return State::WORK_RUNNING;
+}
+
+BasicWork::State
+CatchupWork::doWork()
+{
+    auto nextState = runCatchupStep();
+    mApp.getCatchupManager().logAndUpdateCatchupStatus(true);
+    return nextState;
 }
 
 void
 CatchupWork::onFailureRaise()
 {
+    CLOG(WARNING, "History") << "Catchup failed";
+
     mApp.getCatchupManager().historyCaughtup();
-    asio::error_code ec = std::make_error_code(std::errc::timed_out);
-    mProgressHandler(ec, ProgressState::FINISHED, LedgerHeaderHistoryEntry{});
+    mProgressHandler(ProgressState::FAILED, LedgerHeaderHistoryEntry{},
+                     mCatchupConfiguration.mode());
+    Work::onFailureRaise();
+}
+
+void
+CatchupWork::onSuccess()
+{
+    CLOG(INFO, "History") << "Catchup finished";
+
+    mProgressHandler(ProgressState::FINISHED, mLastApplied,
+                     mCatchupConfiguration.mode());
+    mApp.getCatchupManager().historyCaughtup();
+    Work::onSuccess();
 }
 
 namespace
 {
 
-// compute first checkpoint that is not 100% finished
-// if lastClosedLedger is not last ledger in checkpoint, then first not finished
-// checkpoint is checkpoint containing lastClosedLedger
-// if lastClosedLedger is last ledger in checkpoint, then first not finished
-// checkpoint is next checkpoint (with 0 ledgers applied)
-uint32_t
-firstNotFinishedCheckpoint(uint32_t lastClosedLedger,
-                           HistoryManager const& historyManager)
+CatchupRange::Ledgers
+computeCatchupledgers(uint32_t lastClosedLedger,
+                      CatchupConfiguration const& configuration,
+                      HistoryManager const& historyManager)
 {
-    auto result = historyManager.checkpointContainingLedger(lastClosedLedger);
-    if (lastClosedLedger < result)
+    if (lastClosedLedger == 0)
     {
-        return result;
+        throw std::invalid_argument{"lastClosedLedger == 0"};
     }
-    else
+
+    if (configuration.toLedger() <= lastClosedLedger)
     {
-        return result + historyManager.getCheckpointFrequency();
+        throw std::invalid_argument{
+            "configuration.toLedger() <= lastClosedLedger"};
     }
-}
 
-// return first ledger that should be applied so at least count history entries
-// are stored in database (count 0 is changed to 1, because even doing only
-// bucket apply gives one entry)
-//
-// if it is impossible, returns smallest possible ledger number -
-// LedgerManager::GENESIS_LEDGER_SEQ
-uint32_t
-firstNeededLedger(CatchupConfiguration const& configuration)
-{
-    auto neededCount = std::max(configuration.count(), 1u);
-    return configuration.toLedger() > neededCount
-               ? configuration.toLedger() - neededCount + 1
-               : LedgerManager::GENESIS_LEDGER_SEQ;
-}
+    if (configuration.toLedger() == CatchupConfiguration::CURRENT)
+    {
+        throw std::invalid_argument{
+            "configuration.toLedger() == CatchupConfiguration::CURRENT"};
+    }
 
-std::pair<bool, uint32_t>
-computeCatchupStart(uint32_t smallestLedgerToApply,
-                    uint32_t smallestBucketApplyCheckpoint,
-                    HistoryManager const& historyManager)
-{
+    // do a complete catchup if not starting from new-db
+    if (lastClosedLedger > LedgerManager::GENESIS_LEDGER_SEQ)
+    {
+        return {lastClosedLedger + 1,
+                configuration.toLedger() - lastClosedLedger};
+    }
+
+    // do a complete catchup if count is big enough
+    if (configuration.count() >=
+        configuration.toLedger() - LedgerManager::GENESIS_LEDGER_SEQ)
+    {
+        return {LedgerManager::GENESIS_LEDGER_SEQ + 1,
+                configuration.toLedger() - LedgerManager::GENESIS_LEDGER_SEQ};
+    }
+
+    auto smallestLedgerToApply =
+        configuration.toLedger() - std::max(1u, configuration.count()) + 1;
+
     // checkpoint that contains smallestLedgerToApply - it is first one than
     // can be applied, it is always greater than LCL
+    auto firstCheckpoint = historyManager.checkpointContainingLedger(1);
     auto smallestCheckpointToApply =
         historyManager.checkpointContainingLedger(smallestLedgerToApply);
 
     // if first ledger that should be applied is on checkpoint boundary then
-    // we do an bucket-apply
-    if (smallestLedgerToApply == smallestCheckpointToApply)
+    // we do an bucket-apply, and apply ledgers from next one
+    if (smallestCheckpointToApply == smallestLedgerToApply)
     {
-        return std::make_pair(true, smallestCheckpointToApply);
+        return {smallestLedgerToApply + 1,
+                configuration.toLedger() - smallestLedgerToApply};
     }
 
-    // we are before first checkpoint - applying buckets is not possible, so
-    // just apply transactions
-    if (smallestLedgerToApply < historyManager.getCheckpointFrequency() - 1)
+    // we are before first checkpoint - full catchup is required
+    if (smallestCheckpointToApply == firstCheckpoint)
     {
-        return std::make_pair(false, smallestLedgerToApply);
+        return {LedgerManager::GENESIS_LEDGER_SEQ + 1,
+                configuration.toLedger() - LedgerManager::GENESIS_LEDGER_SEQ};
     }
 
-    // we need to apply on previous checkpoint (if possible), so we are sure
-    // that we get required number of history entries in database
-    smallestCheckpointToApply -= historyManager.getCheckpointFrequency();
-    if (smallestCheckpointToApply >= smallestBucketApplyCheckpoint)
-    {
-        return std::make_pair(true, smallestCheckpointToApply);
-    }
-    else
-    {
-        // in that case we would apply before LCL, so there is no need to
-        // apply buckets
-        return std::make_pair(false, smallestLedgerToApply);
-    }
+    // need one more checkpoint to ensure that smallestLedgerToApply has history
+    // entry
+    return {smallestCheckpointToApply -
+                historyManager.getCheckpointFrequency() + 1,
+            configuration.toLedger() - smallestCheckpointToApply +
+                historyManager.getCheckpointFrequency()};
 }
 }
 
-CatchupRange
-CatchupWork::makeCatchupRange(uint32_t lastClosedLedger,
-                              CatchupConfiguration const& configuration,
-                              HistoryManager const& historyManager)
+CatchupRange::CatchupRange(uint32_t lastClosedLedger,
+                           CatchupConfiguration const& configuration,
+                           HistoryManager const& historyManager)
+    : mLedgers{computeCatchupledgers(lastClosedLedger, configuration,
+                                     historyManager)}
+    , mApplyBuckets{mLedgers.mFirst > lastClosedLedger + 1}
 {
-    assert(lastClosedLedger > 0);
-    assert(configuration.toLedger() >= lastClosedLedger);
-    assert(configuration.toLedger() != CatchupConfiguration::CURRENT);
+}
 
-    // maximum ledger number that we should do "transaction apply" on in order
-    // to replay enough of transaction history
-    auto smallestLedgerToApply =
-        std::max(firstNeededLedger(configuration), lastClosedLedger);
+uint32_t
+CatchupRange::getLast() const
+{
+    return mLedgers.mFirst + mLedgers.mCount - 1;
+}
 
-    // smallest checkpoint value that can be bucket-applied on local ledger -
-    // all lower checkpoints are already fully applied
-    auto smallestBucketApplyCheckpoint =
-        firstNotFinishedCheckpoint(lastClosedLedger, historyManager);
-
-    // check if catchup should start with bucket apply or not and if so,
-    // which checkpoint should it start at
-    auto catchupStart = computeCatchupStart(
-        smallestLedgerToApply, smallestBucketApplyCheckpoint, historyManager);
-
-    // if we are about to apply buckets just after LCL, we can as well apply
-    // transactions
-    if (catchupStart.first && catchupStart.second <= lastClosedLedger + 1)
+uint32_t
+CatchupRange::getBucketApplyLedger() const
+{
+    if (!mApplyBuckets)
     {
-        return {{catchupStart.second, configuration.toLedger()}, false};
+        throw std::logic_error("getBucketApplyLedger() cannot be called on "
+                               "CatchupRange when mApplyBuckets == false");
     }
 
-    return {{catchupStart.second, configuration.toLedger()},
-            catchupStart.first};
+    return mLedgers.mFirst - 1;
 }
 }

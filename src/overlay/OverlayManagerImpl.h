@@ -8,13 +8,20 @@
 #include "Peer.h"
 #include "PeerAuth.h"
 #include "PeerDoor.h"
-#include "PeerRecord.h"
+#include "PeerManager.h"
 #include "herder/TxSetFrame.h"
 #include "overlay/Floodgate.h"
 #include "overlay/ItemFetcher.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/OverlayMetrics.h"
 #include "overlay/StellarXDR.h"
+#include "overlay/SurveyManager.h"
+#include "util/Logging.h"
 #include "util/Timer.h"
+
+#include "lib/util/lrucache.hpp"
+
+#include <future>
 #include <set>
 #include <vector>
 
@@ -34,82 +41,153 @@ class OverlayManagerImpl : public OverlayManager
 {
   protected:
     Application& mApp;
-    std::set<std::string> mPreferredPeers;
+    std::set<PeerBareAddress> mConfigurationPreferredPeers;
 
-    // pending peers - connected, but not authenticated
-    std::vector<Peer::pointer> mPendingPeers;
-    // authenticated and connected peers
-    std::map<NodeID, Peer::pointer> mAuthenticatedPeers;
+    struct PeersList
+    {
+        explicit PeersList(OverlayManagerImpl& overlayManager,
+                           medida::MetricsRegistry& metricsRegistry,
+                           std::string const& directionString,
+                           std::string const& cancelledName,
+                           int maxAuthenticatedCount);
+
+        medida::Meter& mConnectionsAttempted;
+        medida::Meter& mConnectionsEstablished;
+        medida::Meter& mConnectionsDropped;
+        medida::Meter& mConnectionsCancelled;
+
+        OverlayManagerImpl& mOverlayManager;
+        std::string mDirectionString;
+        int mMaxAuthenticatedCount;
+
+        std::vector<Peer::pointer> mPending;
+        std::map<NodeID, Peer::pointer> mAuthenticated;
+
+        Peer::pointer byAddress(PeerBareAddress const& address) const;
+        void removePeer(Peer* peer);
+        bool moveToAuthenticated(Peer::pointer peer);
+        bool acceptAuthenticatedPeer(Peer::pointer peer);
+        void shutdown();
+    };
+
+    PeersList mInboundPeers;
+    PeersList mOutboundPeers;
+
+    PeersList& getPeersList(Peer* peer);
+
+    PeerManager mPeerManager;
     PeerDoor mDoor;
     PeerAuth mAuth;
     LoadManager mLoad;
     bool mShuttingDown;
 
-    medida::Meter& mMessagesReceived;
-    medida::Meter& mMessagesBroadcast;
-    medida::Meter& mConnectionsAttempted;
-    medida::Meter& mConnectionsEstablished;
-    medida::Meter& mConnectionsDropped;
-    medida::Meter& mConnectionsRejected;
-    medida::Counter& mPendingPeersSize;
-    medida::Counter& mAuthenticatedPeersSize;
+    OverlayMetrics mOverlayMetrics;
+
+    // NOTE: bool is used here as a placeholder, since no ValueType is needed.
+    cache::lru_cache<uint64_t, bool> mMessageCache;
+    uint32_t mCheckPerfLogLevelCounter;
+    el::Level mPerfLogLevel;
 
     void tick();
     VirtualTimer mTimer;
-
-    void storePeerList(std::vector<std::string> const& list, bool resetBackOff,
-                       bool preferred);
-    void storeConfigPeers();
+    VirtualTimer mPeerIPTimer;
 
     friend class OverlayManagerTests;
 
     Floodgate mFloodGate;
+
+    std::shared_ptr<SurveyManager> mSurveyManager;
 
   public:
     OverlayManagerImpl(Application& app);
     ~OverlayManagerImpl();
 
     void ledgerClosed(uint32_t lastClosedledgerSeq) override;
-    void recvFloodedMsg(StellarMessage const& msg, Peer::pointer peer) override;
-    void broadcastMessage(StellarMessage const& msg,
-                          bool force = false) override;
-    void connectTo(std::string const& addr) override;
-    void connectTo(PeerRecord& pr) override;
+    bool recvFloodedMsg(StellarMessage const& msg, Peer::pointer peer) override;
+    void broadcastMessage(StellarMessage const& msg, bool force = false,
+                          uint32_t minOverlayVersion = 0) override;
     void connectTo(PeerBareAddress const& address) override;
 
-    void addPendingPeer(Peer::pointer peer) override;
-    void dropPeer(Peer* peer) override;
+    void addInboundConnection(Peer::pointer peer) override;
+    bool addOutboundConnection(Peer::pointer peer) override;
+    void removePeer(Peer* peer) override;
+    void storeConfigPeers();
+    void purgeDeadPeers();
+
     bool acceptAuthenticatedPeer(Peer::pointer peer) override;
-    bool isPreferred(Peer* peer) override;
-    std::vector<Peer::pointer> const& getPendingPeers() const override;
+    bool isPreferred(Peer* peer) const override;
+    std::vector<Peer::pointer> const& getInboundPendingPeers() const override;
+    std::vector<Peer::pointer> const& getOutboundPendingPeers() const override;
+    std::vector<Peer::pointer> getPendingPeers() const override;
     int getPendingPeersCount() const override;
     std::map<NodeID, Peer::pointer> const&
-    getAuthenticatedPeers() const override;
+    getInboundAuthenticatedPeers() const override;
+    std::map<NodeID, Peer::pointer> const&
+    getOutboundAuthenticatedPeers() const override;
+    std::map<NodeID, Peer::pointer> getAuthenticatedPeers() const override;
     int getAuthenticatedPeersCount() const override;
 
     // returns nullptr if the passed peer isn't found
     Peer::pointer getConnectedPeer(PeerBareAddress const& address) override;
 
-    void connectToMorePeers(vector<PeerRecord>& peers);
     std::vector<Peer::pointer> getRandomAuthenticatedPeers() override;
+    std::vector<Peer::pointer> getRandomInboundAuthenticatedPeers() override;
+    std::vector<Peer::pointer> getRandomOutboundAuthenticatedPeers() override;
 
     std::set<Peer::pointer> getPeersKnows(Hash const& h) override;
 
+    OverlayMetrics& getOverlayMetrics() override;
     PeerAuth& getPeerAuth() override;
 
     LoadManager& getLoadManager() override;
+    PeerManager& getPeerManager() override;
+
+    SurveyManager& getSurveyManager() override;
 
     void start() override;
     void shutdown() override;
 
     bool isShuttingDown() const override;
 
-  private:
-    std::vector<PeerRecord> getPreferredPeersFromConfig();
-    std::vector<PeerRecord> getPeersToConnectTo(int maxNum);
+    void recordDuplicateMessageMetric(StellarMessage const& stellarMsg,
+                                      Peer::pointer peer) override;
 
-    void orderByPreferredPeers(vector<PeerRecord>& peers);
+  private:
+    struct ResolvedPeers
+    {
+        std::vector<PeerBareAddress> known;
+        std::vector<PeerBareAddress> preferred;
+    };
+
+    std::map<PeerType, std::unique_ptr<RandomPeerSource>> mPeerSources;
+    std::future<ResolvedPeers> mResolvedPeers;
+
+    void triggerPeerResolution();
+    std::vector<PeerBareAddress>
+    resolvePeers(std::vector<std::string> const& peers);
+    void storePeerList(std::vector<PeerBareAddress> const& addresses,
+                       bool setPreferred, bool startup);
+
+    virtual bool connectToImpl(PeerBareAddress const& address,
+                               bool forceoutbound);
+    int connectTo(int maxNum, PeerType peerType);
+    int connectTo(std::vector<PeerBareAddress> const& peers,
+                  bool forceoutbound);
+    std::vector<PeerBareAddress> getPeersToConnectTo(int maxNum,
+                                                     PeerType peerType);
+
     bool moveToAuthenticated(Peer::pointer peer);
+
+    int availableOutboundPendingSlots() const;
+    int availableOutboundAuthenticatedSlots() const;
+    int nonPreferredAuthenticatedCount() const;
+
+    bool isPossiblyPreferred(std::string const& ip);
+
     void updateSizeCounters();
+
+    void extractPeersFromMap(std::map<NodeID, Peer::pointer> const& peerMap,
+                             std::vector<Peer::pointer>& result);
+    void shufflePeerList(std::vector<Peer::pointer>& peerList);
 };
 }

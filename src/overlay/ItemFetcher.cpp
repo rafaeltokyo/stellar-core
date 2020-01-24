@@ -19,10 +19,7 @@ namespace stellar
 {
 
 ItemFetcher::ItemFetcher(Application& app, AskPeer askPeer)
-    : mApp(app)
-    , mItemMapSize(
-          app.getMetrics().NewCounter({"overlay", "memory", "item-fetch-map"}))
-    , mAskPeer(askPeer)
+    : mApp(app), mAskPeer(askPeer)
 {
 }
 
@@ -36,7 +33,6 @@ ItemFetcher::fetch(Hash itemHash, const SCPEnvelope& envelope)
         TrackerPtr tracker =
             std::make_shared<Tracker>(mApp, itemHash, mAskPeer);
         mTrackers[itemHash] = tracker;
-        mItemMapSize.inc();
 
         tracker->listen(envelope);
         tracker->tryNextPeer();
@@ -102,8 +98,9 @@ ItemFetcher::stopFetchingBelow(uint64 slotIndex)
 {
     // only perform this cleanup from the top of the stack as it causes
     // all sorts of evil side effects
-    mApp.getClock().getIOService().post(
-        [this, slotIndex]() { stopFetchingBelowInternal(slotIndex); });
+    mApp.postOnMainThread(
+        [this, slotIndex]() { stopFetchingBelowInternal(slotIndex); },
+        "ItemFetcher: stopFetchingBelow");
 }
 
 void
@@ -114,7 +111,6 @@ ItemFetcher::stopFetchingBelowInternal(uint64 slotIndex)
         if (!iter->second->clearEnvelopesBelow(slotIndex))
         {
             iter = mTrackers.erase(iter);
-            mItemMapSize.dec();
         }
         else
         {

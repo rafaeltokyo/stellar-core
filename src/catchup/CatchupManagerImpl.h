@@ -21,11 +21,7 @@ class Work;
 class CatchupManagerImpl : public CatchupManager
 {
     Application& mApp;
-    std::shared_ptr<Work> mCatchupWork;
-
-    medida::Meter& mCatchupStart;
-    medida::Meter& mCatchupSuccess;
-    medida::Meter& mCatchupFailure;
+    std::shared_ptr<BasicWork> mCatchupWork;
 
   public:
     CatchupManagerImpl(Application& app);
@@ -34,14 +30,10 @@ class CatchupManagerImpl : public CatchupManager
     void historyCaughtup() override;
 
     void catchupHistory(CatchupConfiguration catchupConfiguration,
-                        bool manualCatchup,
+                        std::shared_ptr<HistoryArchive> archive,
                         CatchupWork::ProgressHandler handler) override;
 
     std::string getStatus() const override;
-
-    uint64_t getCatchupStartCount() const override;
-    uint64_t getCatchupSuccessCount() const override;
-    uint64_t getCatchupFailureCount() const override;
 
     void logAndUpdateCatchupStatus(bool contiguous,
                                    std::string const& message) override;

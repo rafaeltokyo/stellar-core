@@ -18,11 +18,13 @@ class LoopbackPeerConnection;
 
 namespace testutil
 {
-void setCurrentLedgerVersion(LedgerManager& lm, uint32_t currentLedgerVersion);
 void crankSome(VirtualClock& clock);
+void crankFor(VirtualClock& clock, VirtualClock::duration duration);
 void injectSendPeersAndReschedule(VirtualClock::time_point& end,
                                   VirtualClock& clock, VirtualTimer& timer,
                                   LoopbackPeerConnection& connection);
+
+void shutdownWorkScheduler(Application& app);
 
 class BucketListDepthModifier
 {
@@ -33,6 +35,14 @@ class BucketListDepthModifier
 
     ~BucketListDepthModifier();
 };
+
+inline BucketMetadata
+testBucketMetadata(uint32_t protocolVersion)
+{
+    BucketMetadata meta;
+    meta.ledgerVersion = protocolVersion;
+    return meta;
+}
 }
 
 class TestInvariantManager : public InvariantManagerImpl
@@ -59,10 +69,11 @@ template <typename T = TestApplication,
           typename = typename std::enable_if<
               std::is_base_of<TestApplication, T>::value>::type>
 std::shared_ptr<T>
-createTestApplication(VirtualClock& clock, Config const& cfg)
+createTestApplication(VirtualClock& clock, Config const& cfg, bool newDB = true)
 {
     Config c2(cfg);
-    auto app = Application::create<T>(clock, c2);
+    c2.adjust();
+    auto app = Application::create<T>(clock, c2, newDB);
     return app;
 }
 

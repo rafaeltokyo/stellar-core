@@ -7,6 +7,7 @@
 #include "Application.h"
 #include "database/Database.h"
 #include "ledger/LedgerManager.h"
+#include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include <limits>
 #include <regex>

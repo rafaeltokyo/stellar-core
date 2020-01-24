@@ -17,13 +17,9 @@ using namespace std;
 
 static const uint32_t RECENT_CRANK_WINDOW = 1024;
 
-VirtualClock::VirtualClock(Mode mode) : mRealTimer(mIOService), mMode(mode)
+VirtualClock::VirtualClock(Mode mode) : mMode(mode), mRealTimer(mIOContext)
 {
     resetIdleCrankPercent();
-    if (mMode == REAL_TIME)
-    {
-        mNow = std::chrono::system_clock::now();
-    }
 }
 
 VirtualClock::time_point
@@ -31,9 +27,12 @@ VirtualClock::now() noexcept
 {
     if (mMode == REAL_TIME)
     {
-        mNow = std::chrono::system_clock::now();
+        return std::chrono::system_clock::now();
     }
-    return mNow;
+    else
+    {
+        return mVirtualNow;
+    }
 }
 
 void
@@ -139,6 +138,7 @@ VirtualClock::isoStringToTm(std::string const& iso)
     {
         throw std::invalid_argument("Could not parse iso date");
     }
+    std::memset(&res, 0, sizeof(res));
     res.tm_year = y - 1900;
     res.tm_mon = M - 1;
     res.tm_mday = d;
@@ -233,21 +233,10 @@ VirtualClock::cancelAllEvents()
 }
 
 void
-VirtualClock::setCurrentTime(time_point t)
+VirtualClock::setCurrentVirtualTime(time_point t)
 {
     assert(mMode == VIRTUAL_TIME);
-    mNow = t;
-}
-
-size_t
-VirtualClock::advanceToNow()
-{
-    if (mDestructing)
-    {
-        return 0;
-    }
-    assert(mMode == REAL_TIME);
-    return advanceTo(now());
+    mVirtualNow = t;
 }
 
 size_t
@@ -257,44 +246,104 @@ VirtualClock::crank(bool block)
     {
         return 0;
     }
-    nRealTimerCancelEvents = 0;
+
     size_t nWorkDone = 0;
 
-    if (mMode == REAL_TIME)
     {
-        // Fire all pending timers.
-        nWorkDone += advanceToNow();
+        std::lock_guard<std::recursive_mutex> lock(mDelayExecutionMutex);
+        // Adding to mDelayedExecutionQueue is now restricted to main thread.
+
+        mDelayExecution = true;
+
+        nRealTimerCancelEvents = 0;
+
+        if (mMode == REAL_TIME)
+        {
+            // Fire all pending timers.
+            // May add work to mDelayedExecutionQueue
+            nWorkDone += advanceToNow();
+        }
+
+        // Pick up some work off the IO queue.
+        // Calling mIOContext.poll() here may introduce unbounded delays
+        // to trigger timers.
+        const size_t WORK_BATCH_SIZE = 100;
+        size_t lastPoll;
+        size_t i = 0;
+        do
+        {
+            // May add work to mDelayedExecutionQueue.
+            lastPoll = mIOContext.poll_one();
+            nWorkDone += lastPoll;
+        } while (lastPoll != 0 && ++i < WORK_BATCH_SIZE);
+
+        nWorkDone -= nRealTimerCancelEvents;
+
+        if (!mDelayedExecutionQueue.empty())
+        {
+            // If any work is added here, we don't want to advance VIRTUAL_TIME
+            // and also we don't need to block, as next crank will have
+            // something to execute.
+            nWorkDone++;
+            for (auto&& f : mDelayedExecutionQueue)
+            {
+                asio::post(mIOContext, std::move(f));
+            }
+            mDelayedExecutionQueue.clear();
+        }
+
+        if (mMode == VIRTUAL_TIME && nWorkDone == 0)
+        {
+            // If we did nothing and we're in virtual mode, we're idle and can
+            // skip time forward.
+            // May add work to mDelayedExecutionQueue for next crank.
+            nWorkDone += advanceToNext();
+        }
+
+        mDelayExecution = false;
     }
 
-    // pick up some work off the IO queue
-    // calling mIOService.poll() here may introduce unbounded delays
-    // to trigger timers
-    const size_t WORK_BATCH_SIZE = 10;
-    size_t lastPoll;
-    size_t i = 0;
-    do
-    {
-        lastPoll = mIOService.poll_one();
-        nWorkDone += lastPoll;
-    } while (lastPoll != 0 && ++i < WORK_BATCH_SIZE);
-
-    nWorkDone -= nRealTimerCancelEvents;
-
-    if (mMode == VIRTUAL_TIME && nWorkDone == 0)
-    {
-        // If we did nothing and we're in virtual mode,
-        // we're idle and can skip time forward.
-        nWorkDone += advanceToNext();
-    }
-
+    // At this point main and background threads can add work to next crank.
     if (block && nWorkDone == 0)
     {
-        nWorkDone += mIOService.run_one();
+        nWorkDone += mIOContext.run_one();
     }
 
     noteCrankOccurred(nWorkDone == 0);
 
     return nWorkDone;
+}
+
+void
+VirtualClock::postToCurrentCrank(std::function<void()>&& f)
+{
+    asio::post(mIOContext, std::move(f));
+}
+
+void
+VirtualClock::postToNextCrank(std::function<void()>&& f)
+{
+    std::lock_guard<std::recursive_mutex> lock(mDelayExecutionMutex);
+
+    if (!mDelayExecution)
+    {
+        // Either we are waiting on io_context().run_one here, or by some
+        // chance run_one was woke up by network activity and postToNextCrank
+        // was called from background thread during of just after that (before
+        // mutex is again taken by crank). In first case we need to post
+        // directly to io_context to wake up run_one(). In second case this
+        // handler will be executed in poll_one(), a bit earlier that we want.
+        // But with current design it would be at most one additional job per
+        // crank.
+
+        // One immediate post is enough.
+        mDelayExecution = true;
+        asio::post(mIOContext, std::move(f));
+    }
+    else
+    {
+        mDelayedExecutionQueue.emplace_back(std::move(f));
+    }
 }
 
 void
@@ -353,10 +402,10 @@ VirtualClock::resetIdleCrankPercent()
     mRecentIdleCrankCount = RECENT_CRANK_WINDOW >> 1;
 }
 
-asio::io_service&
-VirtualClock::getIOService()
+asio::io_context&
+VirtualClock::getIOContext()
 {
-    return mIOService;
+    return mIOContext;
 }
 
 VirtualClock::~VirtualClock()
@@ -366,7 +415,7 @@ VirtualClock::~VirtualClock()
 }
 
 size_t
-VirtualClock::advanceTo(time_point n)
+VirtualClock::advanceToNow()
 {
     if (mDestructing)
     {
@@ -376,11 +425,11 @@ VirtualClock::advanceTo(time_point n)
 
     // LOG(DEBUG) << "VirtualClock::advanceTo("
     //            << n.time_since_epoch().count() << ")";
-    mNow = n;
+    auto n = now();
     vector<shared_ptr<VirtualClockEvent>> toDispatch;
     while (!mEvents.empty())
     {
-        if (mEvents.top()->mWhen > mNow)
+        if (mEvents.top()->mWhen > n)
             break;
         toDispatch.push_back(mEvents.top());
         mEvents.pop();
@@ -410,7 +459,9 @@ VirtualClock::advanceToNext()
     {
         return 0;
     }
-    return advanceTo(next());
+
+    mVirtualNow = next();
+    return advanceToNow();
 }
 
 VirtualClockEvent::VirtualClockEvent(

@@ -192,6 +192,7 @@ class HistoryManager
         VERIFY_STATUS_ERR_BAD_HASH,
         VERIFY_STATUS_ERR_BAD_LEDGER_VERSION,
         VERIFY_STATUS_ERR_OVERSHOT,
+        VERIFY_STATUS_ERR_UNDERSHOT,
         VERIFY_STATUS_ERR_MISSING_ENTRIES
     };
 
@@ -270,6 +271,10 @@ class HistoryManager
     // queue.
     virtual std::vector<std::string> getBucketsReferencedByPublishQueue() = 0;
 
+    // Return the full set of HistoryArchiveStates in the persistent (DB)
+    // publish queue.
+    virtual std::vector<HistoryArchiveState> getPublishQueueStates() = 0;
+
     // Callback from Publication, indicates that a given snapshot was
     // published. The `success` parameter indicates whether _all_ the
     // configured archives published correctly; if so the snapshot
@@ -280,15 +285,8 @@ class HistoryManager
                      std::vector<std::string> const& originalBuckets,
                      bool success) = 0;
 
-    virtual void downloadMissingBuckets(
-        HistoryArchiveState desiredState,
-        std::function<void(asio::error_code const& ec)> handler) = 0;
-
-    // Return the HistoryArchiveState of the LedgerManager's LCL
-    virtual HistoryArchiveState getLastClosedHistoryArchiveState() const = 0;
-
     // Infer a quorum set by reading SCP messages in history archives.
-    virtual InferredQuorum inferQuorum() = 0;
+    virtual InferredQuorum inferQuorum(uint32_t ledgerNum) = 0;
 
     // Return the name of the HistoryManager's tmpdir (used for storing files in
     // transit).
@@ -301,18 +299,19 @@ class HistoryManager
     // Return the number of checkpoints that have been enqueued for
     // publication. This may be less than the number "started", but every
     // enqueued checkpoint should eventually start.
-    virtual uint64_t getPublishQueueCount() = 0;
-
-    // Return the number of enqueued checkpoints that have been delayed due to
-    // the publish system being busy with a previous checkpoint. This indicates
-    // a degree of overloading in the publish system.
-    virtual uint64_t getPublishDelayCount() = 0;
+    virtual uint64_t getPublishQueueCount() const = 0;
 
     // Return the number of checkpoints that completed publication successfully.
-    virtual uint64_t getPublishSuccessCount() = 0;
+    virtual uint64_t getPublishSuccessCount() const = 0;
 
     // Return the number of checkpoints that failed publication.
-    virtual uint64_t getPublishFailureCount() = 0;
+    virtual uint64_t getPublishFailureCount() const = 0;
+
+#ifdef BUILD_TESTS
+    // Enable or disable history publication, purely a testing interface.
+    // History is still queued when publication is disabled.
+    virtual void setPublicationEnabled(bool enabled) = 0;
+#endif
 
     virtual ~HistoryManager(){};
 };

@@ -5,12 +5,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include <memory>
+#include <string>
 #include <vector>
-
-namespace Json
-{
-class Value;
-}
 
 namespace stellar
 {
@@ -47,7 +43,7 @@ class HistoryArchiveManager
     std::vector<std::shared_ptr<HistoryArchive>>
     getWritableHistoryArchives() const;
 
-    Json::Value getJsonInfo() const;
+    double getFailureRate() const;
 
   private:
     Application& mApp;

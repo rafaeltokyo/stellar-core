@@ -8,6 +8,8 @@
 
 namespace stellar
 {
+class AbstractLedgerTxn;
+
 class InflationOpFrame : public OperationFrame
 {
     InflationResult&
@@ -22,9 +24,9 @@ class InflationOpFrame : public OperationFrame
     InflationOpFrame(Operation const& op, OperationResult& res,
                      TransactionFrame& parentTx);
 
-    bool doApply(Application& app, LedgerDelta& delta,
-                 LedgerManager& ledgerManager) override;
-    bool doCheckValid(Application& app) override;
+    bool doApply(AbstractLedgerTxn& ltx) override;
+    bool doCheckValid(uint32_t ledgerVersion) override;
+    bool isVersionSupported(uint32_t protocolVersion) const override;
 
     static InflationResultCode
     getInnerCode(OperationResult const& res)

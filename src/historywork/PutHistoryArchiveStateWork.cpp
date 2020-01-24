@@ -6,78 +6,88 @@
 #include "history/HistoryArchive.h"
 #include "historywork/MakeRemoteDirWork.h"
 #include "historywork/PutRemoteFileWork.h"
+#include "main/ErrorMessages.h"
 #include "util/Logging.h"
 
 namespace stellar
 {
 
 PutHistoryArchiveStateWork::PutHistoryArchiveStateWork(
-    Application& app, WorkParent& parent, HistoryArchiveState const& state,
+    Application& app, HistoryArchiveState const& state,
     std::shared_ptr<HistoryArchive> archive)
-    : Work(app, parent, "put-history-archive-state")
+    // Retry once in case of an unexpected failure during upload (e.g. deleted
+    // file)
+    : Work(app, "put-history-archive-state", BasicWork::RETRY_ONCE)
     , mState(state)
     , mArchive(archive)
     , mLocalFilename(HistoryArchiveState::localName(app, archive->getName()))
 {
-}
-
-PutHistoryArchiveStateWork::~PutHistoryArchiveStateWork()
-{
-    clearChildren();
+    if (!mState.containsValidBuckets(mApp))
+    {
+        throw std::runtime_error("Malformed HAS, unable to publish");
+    }
 }
 
 void
-PutHistoryArchiveStateWork::onReset()
+PutHistoryArchiveStateWork::doReset()
 {
-    clearChildren();
     mPutRemoteFileWork.reset();
     std::remove(mLocalFilename.c_str());
 }
 
-void
-PutHistoryArchiveStateWork::onRun()
+BasicWork::State
+PutHistoryArchiveStateWork::doWork()
 {
     if (!mPutRemoteFileWork)
     {
         try
         {
             mState.save(mLocalFilename);
-            scheduleSuccess();
+            spawnPublishWork();
+            return State::WORK_RUNNING;
         }
         catch (std::runtime_error& e)
         {
             CLOG(ERROR, "History")
-                << "error loading history state: " << e.what();
-            scheduleFailure();
+                << "Error saving history state: " << e.what();
+            CLOG(ERROR, "History") << POSSIBLY_CORRUPTED_LOCAL_FS;
+            return State::WORK_FAILURE;
         }
     }
     else
     {
-        scheduleSuccess();
+        return checkChildrenStatus();
     }
 }
 
-Work::State
-PutHistoryArchiveStateWork::onSuccess()
+void
+PutHistoryArchiveStateWork::spawnPublishWork()
 {
-    if (!mPutRemoteFileWork)
-    {
-        // Put the file in the history/ww/xx/yy/history-wwxxyyzz.json file
-        auto seqName = HistoryArchiveState::remoteName(mState.currentLedger);
-        auto seqDir = HistoryArchiveState::remoteDir(mState.currentLedger);
-        mPutRemoteFileWork =
-            addWork<PutRemoteFileWork>(mLocalFilename, seqName, mArchive);
-        mPutRemoteFileWork->addWork<MakeRemoteDirWork>(seqDir, mArchive);
+    // Put the file in the history/ww/xx/yy/history-wwxxyyzz.json file
+    auto seqName = HistoryArchiveState::remoteName(mState.currentLedger);
+    auto seqDir = HistoryArchiveState::remoteDir(mState.currentLedger);
 
-        // Also put it in the .well-known/stellar-history.json file
-        auto wkName = HistoryArchiveState::wellKnownRemoteName();
-        auto wkDir = HistoryArchiveState::wellKnownRemoteDir();
-        auto wkWork =
-            addWork<PutRemoteFileWork>(mLocalFilename, wkName, mArchive);
-        wkWork->addWork<MakeRemoteDirWork>(wkDir, mArchive);
+    auto w1 = std::make_shared<MakeRemoteDirWork>(mApp, seqDir, mArchive);
+    auto w2 = std::make_shared<PutRemoteFileWork>(mApp, mLocalFilename, seqName,
+                                                  mArchive);
 
-        return WORK_PENDING;
-    }
-    return WORK_SUCCESS;
+    std::vector<std::shared_ptr<BasicWork>> seq{w1, w2};
+
+    // mkdir and put inside the sequence already retry a lot
+    mPutRemoteFileWork = addWork<WorkSequence>("put-history-file-sequence", seq,
+                                               BasicWork::RETRY_NEVER);
+
+    // Also put it in the .well-known/stellar-history.json file
+    auto wkName = HistoryArchiveState::wellKnownRemoteName();
+    auto wkDir = HistoryArchiveState::wellKnownRemoteDir();
+
+    auto w3 = std::make_shared<MakeRemoteDirWork>(mApp, wkDir, mArchive);
+    auto w4 = std::make_shared<PutRemoteFileWork>(mApp, mLocalFilename, wkName,
+                                                  mArchive);
+
+    // mkdir and put inside the sequence already retry a lot
+    std::vector<std::shared_ptr<BasicWork>> seqWk{w3, w4};
+    auto wellKnownPut = addWork<WorkSequence>("put-history-well-known-sequence",
+                                              seqWk, BasicWork::RETRY_NEVER);
 }
 }

@@ -4,10 +4,13 @@
 
 #include "OfferExchange.h"
 #include "database/Database.h"
-#include "ledger/LedgerDelta.h"
 #include "ledger/LedgerManager.h"
-#include "ledger/TrustFrame.h"
+#include "ledger/LedgerTxn.h"
+#include "ledger/LedgerTxnEntry.h"
+#include "ledger/LedgerTxnHeader.h"
+#include "ledger/TrustLineWrapper.h"
 #include "lib/util/uint128_t.h"
+#include "transactions/TransactionUtils.h"
 #include "util/Logging.h"
 
 namespace stellar
@@ -15,8 +18,9 @@ namespace stellar
 // returns the amount of wheat that would be traded
 // while buying as much sheep as possible
 int64_t
-canSellAtMostBasedOnSheep(Asset const& sheep, TrustFrame::pointer sheepLine,
-                          Price const& wheatPrice, LedgerManager& ledgerManager)
+canSellAtMostBasedOnSheep(LedgerTxnHeader const& header, Asset const& sheep,
+                          ConstTrustLineWrapper const& sheepLine,
+                          Price const& wheatPrice)
 {
     if (sheep.type() == ASSET_TYPE_NATIVE)
     {
@@ -24,8 +28,7 @@ canSellAtMostBasedOnSheep(Asset const& sheep, TrustFrame::pointer sheepLine,
     }
 
     // compute value based on what the account can receive
-    auto sellerMaxSheep =
-        sheepLine ? sheepLine->getMaxAmountReceive(ledgerManager) : 0;
+    auto sellerMaxSheep = sheepLine ? sheepLine.getMaxAmountReceive(header) : 0;
 
     auto wheatAmount = int64_t{};
     if (!bigDivide(wheatAmount, sellerMaxSheep, wheatPrice.d, wheatPrice.n,
@@ -38,40 +41,70 @@ canSellAtMostBasedOnSheep(Asset const& sheep, TrustFrame::pointer sheepLine,
 }
 
 int64_t
-canSellAtMost(AccountFrame::pointer account, Asset const& asset,
-              TrustFrame::pointer trustLine, LedgerManager& ledgerManager)
+canSellAtMost(LedgerTxnHeader const& header, LedgerTxnEntry const& account,
+              Asset const& asset, TrustLineWrapper const& trustLine)
 {
     if (asset.type() == ASSET_TYPE_NATIVE)
     {
         // can only send above the minimum balance
-        return std::max(
-            {account->getAvailableBalance(ledgerManager), int64_t(0)});
+        return std::max({getAvailableBalance(header, account), int64_t(0)});
     }
 
-    if (trustLine && trustLine->isAuthorized())
+    if (trustLine && trustLine.isAuthorized())
     {
-        return std::max(
-            {trustLine->getAvailableBalance(ledgerManager), int64_t(0)});
+        return std::max({trustLine.getAvailableBalance(header), int64_t(0)});
     }
 
     return 0;
 }
 
 int64_t
-canBuyAtMost(AccountFrame::pointer account, Asset const& asset,
-             TrustFrame::pointer trustLine, LedgerManager& ledgerManager)
+canSellAtMost(LedgerTxnHeader const& header, ConstLedgerTxnEntry const& account,
+              Asset const& asset, ConstTrustLineWrapper const& trustLine)
 {
     if (asset.type() == ASSET_TYPE_NATIVE)
     {
-        return std::max(
-            {account->getMaxAmountReceive(ledgerManager), int64_t(0)});
+        // can only send above the minimum balance
+        return std::max({getAvailableBalance(header, account), int64_t(0)});
+    }
+
+    if (trustLine && trustLine.isAuthorized())
+    {
+        return std::max({trustLine.getAvailableBalance(header), int64_t(0)});
+    }
+
+    return 0;
+}
+
+int64_t
+canBuyAtMost(LedgerTxnHeader const& header, LedgerTxnEntry const& account,
+             Asset const& asset, TrustLineWrapper const& trustLine)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        return std::max({getMaxAmountReceive(header, account), int64_t(0)});
     }
     else
     {
-        return trustLine
-                   ? std::max({trustLine->getMaxAmountReceive(ledgerManager),
-                               int64_t(0)})
-                   : 0;
+        return trustLine ? std::max({trustLine.getMaxAmountReceive(header),
+                                     int64_t(0)})
+                         : 0;
+    }
+}
+
+int64_t
+canBuyAtMost(LedgerTxnHeader const& header, ConstLedgerTxnEntry const& account,
+             Asset const& asset, ConstTrustLineWrapper const& trustLine)
+{
+    if (asset.type() == ASSET_TYPE_NATIVE)
+    {
+        return std::max({getMaxAmountReceive(header, account), int64_t(0)});
+    }
+    else
+    {
+        return trustLine ? std::max({trustLine.getMaxAmountReceive(header),
+                                     int64_t(0)})
+                         : 0;
     }
 }
 
@@ -226,7 +259,7 @@ calculateOfferValue(int32_t priceN, int32_t priceD, int64_t maxSend,
 // sheepValue can be thought of as the rescaled size of the sheep offer in terms
 // of sheep after considering all limits.
 //
-// If isPathPayment == false --------------------------------------------------
+// If round == NORMAL --------------------------------------------------------
 // We first consider the case (wheatStays && price.n > price.d). Then
 //     wheatReceive = floor(sheepValue / price.n)
 //                  <= sheepValue / price.n
@@ -350,7 +383,7 @@ calculateOfferValue(int32_t priceN, int32_t priceD, int64_t maxSend,
 //         = price.n / price.d
 // so in this case the seller of sheep is favored.
 //
-// If isPathPayment == true ---------------------------------------------------
+// If round == PATH_PAYMENT_STRICT_RECEIVE ------------------------------------
 // We first consider the case wheatStays. In this case, we guarantee that the
 // effective price favors wheat
 //     sheepSend / wheatReceive >= price.n / price.d
@@ -416,7 +449,7 @@ calculateOfferValue(int32_t priceN, int32_t priceD, int64_t maxSend,
 //     maxWheatReceive = 101
 //     maxSheepSend = INT64_MAX
 //     maxSheepReceive = INT64_MAX
-//     isPathPayment = true
+//     round = PATH_PAYMENT_STRICT_RECEIVE
 // so
 //     wheatValue = min(2 * 150, 3 * INT64_MAX) = 300
 //     sheepValue = min(3 * INT64_MAX, 2 * 101) = 202
@@ -428,28 +461,165 @@ calculateOfferValue(int32_t priceN, int32_t priceD, int64_t maxSend,
 // and clearly wheatReceive == 100 != 101 == maxWheatReceive.
 //
 // At this point we have determined what must occur if wheatStays but have not
-// addressed the case !wheatStays. If wheatReceive == maxWheatReceive, then the
-// operation succeeds. If wheatReceive < maxWheatReceive, then the operation
-// will cross additional offers since !wheatStays.
+// addressed the case !wheatStays. If wheatReceive = maxWheatReceive, then the
+// operation succeeds. Otherwise, if sheepSend = maxSheepSend then the operation
+// fails. If wheatReceive < maxWheatReceive and sheepSend < maxSheepSend, then
+// the operation will cross additional offers since !wheatStays.
+//
+// If round == PATH_PAYMENT_STRICT_SEND ---------------------------------------
+// We first consider the case (wheatStays && price.n > price.d). Then
+//     wheatReceive = floor(sheepValue / price.n)
+//                  <= floor((maxWheatReceive * price.n) / price.n)
+//                  = maxWheatReceive
+//     wheatReceive = floor(sheepValue / price.n)
+//                  <= floor(wheatValue / price.n)
+//                  <= floor((maxWheatSend * price.n) / price.n)
+//                  = maxWheatSend
+// so wheatReceive cannot exceed its limits. Because wheatStays, we know that
+// this is the last offer that will be crossed so
+//     sheepSend = min(maxSheepSend, maxSheepReceive)
+// Therefore if maxSheepSend > maxSheepReceive then the operation must fail. Now
+// the effective price would be
+//     sheepSend / wheatReceive
+//         = min(maxSheepSend / wheatReceive, maxSheepReceive / wheatReceive)
+// where
+//     maxSheepSend / wheatReceive
+//         = maxSheepSend / floor(sheepValue / price.n)
+//         >= maxSheepSend / (sheepValue / price.n)
+//         = maxSheepSend * price.n / sheepValue
+//         >= maxSheepSend * price.n / (maxSheepSend * price.d)
+//         = price.n / price.d
+//     maxSheepReceive / wheatReceive
+//         = maxSheepReceive / floor(sheepValue / price.n)
+//         >= maxSheepReceive / (sheepValue / price.n)
+//         = maxSheepReceive * price.n / sheepValue
+//         > maxSheepReceive * price.n / wheatValue
+//         >= maxSheepReceive * price.n / (maxSheepReceive * price.d)
+//         = price.n / price.d
+// so in this case the seller of wheat is favored.
+//
+// Suppose that wheatReceive < maxWheatReceive. This implies that
+//     sheepValue = maxSheepSend * price.d
+// for otherwise we would have
+//     sheepValue = maxWheatReceive * price.n
+// and
+//     wheatReceive = floor(sheepValue / price.n)
+//                  = floor((maxWheatReceive * price.n) / price.n)
+//                  = maxWheatReceive
+// It follows from this that
+//     maxSheepReceive > maxSheepSend
+// for otherwise
+//     maxSheepReceive <= maxSheepSend
+// and
+//     wheatValue <= maxSheepReceive * price.d
+//                <= maxSheepSend * price.d
+//                = sheepValue
+// which contradicts the assumption that wheatStays. We claim that wheatReceive
+// is the maximum amount of wheat that could be received without favoring the
+// seller of sheep. To see this, observe that
+//     sheepSend / (wheatReceive + 1)
+//         = maxSheepSend / (floor(sheepValue / price.n) + 1)
+//         = maxSheepSend / (floor(maxSheepSend * price.d / price.n) + 1)
+//         <= maxSheepSend / ceil(maxSheepSend * price.d / price.n)
+//         <= maxSheepSend / (maxSheepSend * price.d / price.n)
+//         <= price.n / price.d
+// Now for any integer K >= 1 we must have
+//     sheepSend / (wheatReceive + K)
+//         <= sheepSend / (wheatReceive + 1)
+//         <= price.n / price.d
+// which proves the claim.
+//
+// At this point we have determined what must occur if wheatStays but have not
+// addressed the case !wheatStays. If sheepSend = maxSheepSend, then the
+// operation succeeds. Otherwise, if wheatReceive = maxWheatReceive then the
+// operation fails. If sheepSend < maxSheepSend and wheatReceive <
+// maxWheatReceive, then the operation will cross additional offers since
+// !wheatStays.
 ExchangeResultV10
 exchangeV10(Price price, int64_t maxWheatSend, int64_t maxWheatReceive,
-            int64_t maxSheepSend, int64_t maxSheepReceive, bool isPathPayment)
+            int64_t maxSheepSend, int64_t maxSheepReceive, RoundingType round)
 {
     auto beforeThresholds = exchangeV10WithoutPriceErrorThresholds(
         price, maxWheatSend, maxWheatReceive, maxSheepSend, maxSheepReceive,
-        isPathPayment);
-    return applyPriceErrorThresholds(
-        price, beforeThresholds.numWheatReceived, beforeThresholds.numSheepSend,
-        beforeThresholds.wheatStays, isPathPayment);
+        round);
+    return applyPriceErrorThresholds(price, beforeThresholds.numWheatReceived,
+                                     beforeThresholds.numSheepSend,
+                                     beforeThresholds.wheatStays, round);
 }
 
-// See comment before exchangeV10.
+// See comment before exchangeV10 for proof of some important properties. We
+// will prove that for rounding modes NORMAL and PATH_PAYMENT_STRICT_RECEIVE,
+// wheatReceive == 0 if and only if sheepSend == 0. We will also prove that for
+// rounding mode PATH_PAYMENT_STRICT_SEND, sheepSend > 0 is guaranteed.
+//
+// We first address the case (!wheatStays && price.n > price.d). Then it follows
+// from wheatReceive = 0 that
+//     sheepSend = floor(wheatReceive * price.n / price.d)
+// so sheepSend = 0. Similarly, if sheepSend = 0 then
+//     sheepSend = floor(wheatReceive * price.n / price.d)
+//               >= floor(wheatReceive)
+//               = wheatReceive
+// so 0 <= wheatReceive <= 0 implies wheatReceive = 0.
+//
+// Similarly, we investigate when (!wheatStays && price.n <= price.d). Then it
+// follows from sheepSend = 0 that
+//     wheatReceive = ceil(sheepSend * price.d / price.n)
+// so wheatReceive = 0. Similary, if wheatReceive = 0 then
+//     wheatReceive = ceil(sheepSend * price.d / price.n)
+//                  >= ceil(sheepSend)
+//                  = sheepSend
+// so 0 <= sheepSend <= 0 implies sheepSend = 0.
+//
+// These first two results hold regardless of the rounding mode.
+//
+// If round == NORMAL ---------------------------------------------------------
+// We turn our attention to the case (wheatStays && price.n > price.d). Then it
+// follows from wheatReceive = 0 that
+//     sheepSend = ceil(wheatReceive * price.n / price.d)
+// so sheepSend = 0. Similarly, if sheepSend = 0 then
+//     sheepSend = ceil(wheatReceive * price.n / price.d)
+//               >= ceil(wheatReceive)
+//               = wheatReceive
+// so 0 <= wheatReceive <= 0 implies wheatReceive = 0.
+//
+// Next consider the case (wheatStays && price.n <= price.d). Then it follows
+// from sheepSend = 0 that
+//     wheatReceive = floor(sheepSend * price.d / price.n)
+// so wheatReceive = 0. Similarly, if wheatReceive = 0 then
+//     wheatReceive = floor(sheepSend * price.d / price.n)
+//                  >= floor(sheepSend)
+//                  = sheepSend
+// so 0 <= sheepSend <= 0 implies sheepSend = 0.
+//
+// If round == PATH_PAYMENT_STRICT_RECEIVE ------------------------------------
+// The case (wheatStays && price.n > price.d) is identical to the analogous case
+// when round == NORMAL.
+//
+// We now consider the case (wheatStays && price.n <= price.d). Then it follows
+// from wheatReceive = 0 that
+//     sheepSend = ceil(wheatReceive * price.n / price.d)
+// so sheepSend = 0. Similarly, if sheepSend = 0 then
+//     sheepSend = ceil(wheatReceive * price.n / price.d)
+//               >= ceil(wheatReceive * 1 / INT32_MAX)
+//               = ceil(wheatReceive / INT32_MAX)
+// Suppose that wheatReceive > 0. Then
+//     sheepSend >= ceil(1 / INT32_MAX) = 1
+// which is a contradiction, so 0 <= wheatReceive <= 0 implies wheatReceive = 0.
+//
+// If round == PATH_PAYMENT_STRICT_SEND ---------------------------------------
+// Finally, we address the more complicated case (wheatStays). Suppose that we
+// have sheepSend = 0. Then clearly maxSheepSend = 0 or maxSheepReceive = 0. But
+// if maxSheepSend = 0, then we should have already stopped crossing offers
+// because no more can be sent. Similarly if maxSheepReceive = 0, then the offer
+// should have already been removed from the order book because no more can be
+// received. In either case, we have reached a contradiction because we would
+// not be crossing in either case. We conclude that sheepSend > 0.
 ExchangeResultV10
 exchangeV10WithoutPriceErrorThresholds(Price price, int64_t maxWheatSend,
                                        int64_t maxWheatReceive,
                                        int64_t maxSheepSend,
                                        int64_t maxSheepReceive,
-                                       bool isPathPayment)
+                                       RoundingType round)
 {
     uint128_t wheatValue =
         calculateOfferValue(price.n, price.d, maxWheatSend, maxSheepReceive);
@@ -461,7 +631,13 @@ exchangeV10WithoutPriceErrorThresholds(Price price, int64_t maxWheatSend,
     int64_t sheepSend;
     if (wheatStays)
     {
-        if (price.n > price.d || isPathPayment) // Wheat is more valuable
+        if (round == RoundingType::PATH_PAYMENT_STRICT_SEND)
+        {
+            wheatReceive = bigDivide(sheepValue, price.n, ROUND_DOWN);
+            sheepSend = std::min({maxSheepSend, maxSheepReceive});
+        }
+        else if (price.n > price.d || // Wheat is more valuable
+                 round == RoundingType::PATH_PAYMENT_STRICT_RECEIVE)
         {
             wheatReceive = bigDivide(sheepValue, price.n, ROUND_DOWN);
             sheepSend = bigDivide(wheatReceive, price.n, price.d, ROUND_UP);
@@ -507,7 +683,7 @@ exchangeV10WithoutPriceErrorThresholds(Price price, int64_t maxWheatSend,
 // See comment before exchangeV10.
 ExchangeResultV10
 applyPriceErrorThresholds(Price price, int64_t wheatReceive, int64_t sheepSend,
-                          bool wheatStays, bool isPathPayment)
+                          bool wheatStays, RoundingType round)
 {
     if (wheatReceive > 0 && sheepSend > 0)
     {
@@ -526,7 +702,7 @@ applyPriceErrorThresholds(Price price, int64_t wheatReceive, int64_t sheepSend,
             throw std::runtime_error("favored wheat when sheep stays");
         }
 
-        if (!isPathPayment)
+        if (round == RoundingType::NORMAL)
         {
             // Both sellers must get a price no more than 1% worse than the
             // price crossed. Otherwise, no trade occurs.
@@ -539,13 +715,14 @@ applyPriceErrorThresholds(Price price, int64_t wheatReceive, int64_t sheepSend,
         else
         {
             // When the wheat seller is favored, they can be arbitrarily favored
-            // since path payment has a sendMax parameter to determine whether
-            // a price was acceptable. When the sheep seller is favored, we
-            // still want the wheat seller to get a price no more than 1% worse
-            // than the price crossed. The sheep seller can only be favored if
-            // !wheatStays, and in this case the entire offer will be taken. But
-            // the offer was adjusted immediately before exchangeV10, so we
-            // know that it satisfies the threshold in this case.
+            // since path payment has a sendMax or destMin parameter to
+            // determine whether a price was acceptable. When the sheep seller
+            // is favored, we still want the wheat seller to get a price no more
+            // than 1% worse than the price crossed. The sheep seller can only
+            // be favored if !wheatStays, and in this case the entire offer will
+            // be taken. But the offer was adjusted immediately before
+            // exchangeV10, so we know that it satisfies the threshold in this
+            // case.
             if (!checkPriceErrorBound(price, wheatReceive, sheepSend, true))
             {
                 throw std::runtime_error("exceeded price error bound");
@@ -554,8 +731,28 @@ applyPriceErrorThresholds(Price price, int64_t wheatReceive, int64_t sheepSend,
     }
     else
     {
-        wheatReceive = 0;
-        sheepSend = 0;
+        switch (round)
+        {
+        case RoundingType::PATH_PAYMENT_STRICT_SEND:
+            // For PathPaymentStrictSend, there are situations when the sender
+            // must sell sheep for no wheat in order to send exactly the
+            // specified amount. This is acceptable because there is still the
+            // overall constraint on amount received. However, it should never
+            // happen that the sender sells no sheep and we throw in this case.
+            if (sheepSend == 0)
+            {
+                throw std::runtime_error("invalid amount of sheep sent");
+            }
+            break;
+        default:
+            // Based on the proof proceeding
+            // exchangeV10WithoutPriceErrorThresholds, we should already have
+            // wheatReceive = 0 and sheepSend = 0. We set it explicitly for
+            // clarity.
+            wheatReceive = 0;
+            sheepSend = 0;
+            break;
+        }
     }
 
     ExchangeResultV10 res;
@@ -565,189 +762,16 @@ applyPriceErrorThresholds(Price price, int64_t wheatReceive, int64_t sheepSend,
     return res;
 }
 
-LoadBestOfferContext::LoadBestOfferContext(Database& db, Asset const& selling,
-                                           Asset const& buying)
-    : mSelling(selling), mBuying(buying), mDb(db), mBatchIterator(mBatch.end())
-{
-    loadBatchIfNecessary();
-}
-
 void
-LoadBestOfferContext::loadBatchIfNecessary()
+adjustOffer(LedgerTxnHeader const& header, LedgerTxnEntry& offer,
+            LedgerTxnEntry const& account, Asset const& wheat,
+            TrustLineWrapper const& wheatLine, Asset const& sheep,
+            TrustLineWrapper const& sheepLine)
 {
-    if (mBatchIterator == mBatch.end())
-    {
-        mBatch.clear();
-        OfferFrame::loadBestOffers(5, 0, mSelling, mBuying, mBatch, mDb);
-        mBatchIterator = mBatch.begin();
-    }
-}
-
-OfferFrame::pointer
-LoadBestOfferContext::loadBestOffer()
-{
-    return (mBatchIterator != mBatch.end()) ? *mBatchIterator : nullptr;
-}
-
-void
-LoadBestOfferContext::eraseAndUpdate()
-{
-    ++mBatchIterator;
-    loadBatchIfNecessary();
-}
-
-OfferExchange::OfferExchange(LedgerDelta& delta, LedgerManager& ledgerManager)
-    : mDelta(delta), mLedgerManager(ledgerManager)
-{
-}
-
-OfferExchange::CrossOfferResult
-OfferExchange::crossOffer(OfferFrame& sellingWheatOffer,
-                          int64_t maxWheatReceived, int64_t& numWheatReceived,
-                          int64_t maxSheepSend, int64_t& numSheepSend)
-{
-    assert(maxWheatReceived > 0);
-    assert(maxSheepSend > 0);
-
-    // we're about to make changes to the offer
-    mDelta.recordEntry(sellingWheatOffer);
-
-    Asset& sheep = sellingWheatOffer.getOffer().buying;
-    Asset& wheat = sellingWheatOffer.getOffer().selling;
-    AccountID& accountBID = sellingWheatOffer.getOffer().sellerID;
-
-    Database& db = mLedgerManager.getDatabase();
-
-    AccountFrame::pointer accountB;
-    accountB = AccountFrame::loadAccount(mDelta, accountBID, db);
-    if (!accountB)
-    {
-        throw std::runtime_error(
-            "invalid database state: offer must have matching account");
-    }
-
-    TrustFrame::pointer wheatLineAccountB;
-    if (wheat.type() != ASSET_TYPE_NATIVE)
-    {
-        wheatLineAccountB =
-            TrustFrame::loadTrustLine(accountBID, wheat, db, &mDelta);
-    }
-
-    TrustFrame::pointer sheepLineAccountB;
-    if (sheep.type() != ASSET_TYPE_NATIVE)
-    {
-        sheepLineAccountB =
-            TrustFrame::loadTrustLine(accountBID, sheep, db, &mDelta);
-    }
-
-    numWheatReceived = std::min(
-        {canSellAtMostBasedOnSheep(sheep, sheepLineAccountB,
-                                   sellingWheatOffer.getOffer().price,
-                                   mLedgerManager),
-         canSellAtMost(accountB, wheat, wheatLineAccountB, mLedgerManager),
-         sellingWheatOffer.getOffer().amount});
-    assert(numWheatReceived >= 0);
-
-    sellingWheatOffer.getOffer().amount = numWheatReceived;
-    auto exchangeResult =
-        mLedgerManager.getCurrentLedgerVersion() < 3
-            ? exchangeV2(numWheatReceived, sellingWheatOffer.getOffer().price,
-                         maxWheatReceived, maxSheepSend)
-            : exchangeV3(numWheatReceived, sellingWheatOffer.getOffer().price,
-                         maxWheatReceived, maxSheepSend);
-
-    numWheatReceived = exchangeResult.numWheatReceived;
-    numSheepSend = exchangeResult.numSheepSend;
-
-    bool offerTaken = false;
-
-    switch (exchangeResult.type())
-    {
-    case ExchangeResultType::REDUCED_TO_ZERO:
-        return eOfferCantConvert;
-    case ExchangeResultType::BOGUS:
-        // force delete the offer as it represents a bogus offer
-        numWheatReceived = 0;
-        numSheepSend = 0;
-        offerTaken = true;
-        break;
-    default:
-        break;
-    }
-
-    offerTaken =
-        offerTaken || sellingWheatOffer.getOffer().amount <= numWheatReceived;
-    if (offerTaken)
-    { // entire offer is taken
-        sellingWheatOffer.storeDelete(mDelta, db);
-
-        accountB->addNumEntries(-1, mLedgerManager);
-        accountB->storeChange(mDelta, db);
-    }
-    else
-    {
-        sellingWheatOffer.getOffer().amount -= numWheatReceived;
-        sellingWheatOffer.storeChange(mDelta, db);
-    }
-
-    // Adjust balances
-    if (numSheepSend != 0)
-    {
-        if (sheep.type() == ASSET_TYPE_NATIVE)
-        {
-            if (!accountB->addBalance(numSheepSend, mLedgerManager))
-            {
-                return eOfferCantConvert;
-            }
-            accountB->storeChange(mDelta, db);
-        }
-        else
-        {
-            if (!sheepLineAccountB->addBalance(numSheepSend, mLedgerManager))
-            {
-                return eOfferCantConvert;
-            }
-            sheepLineAccountB->storeChange(mDelta, db);
-        }
-    }
-
-    if (numWheatReceived != 0)
-    {
-        if (wheat.type() == ASSET_TYPE_NATIVE)
-        {
-            if (!accountB->addBalance(-numWheatReceived, mLedgerManager))
-            {
-                return eOfferCantConvert;
-            }
-            accountB->storeChange(mDelta, db);
-        }
-        else
-        {
-            if (!wheatLineAccountB->addBalance(-numWheatReceived,
-                                               mLedgerManager))
-            {
-                return eOfferCantConvert;
-            }
-            wheatLineAccountB->storeChange(mDelta, db);
-        }
-    }
-
-    mOfferTrail.push_back(
-        ClaimOfferAtom(accountB->getID(), sellingWheatOffer.getOfferID(), wheat,
-                       numWheatReceived, sheep, numSheepSend));
-
-    return offerTaken ? eOfferTaken : eOfferPartial;
-}
-
-void
-adjustOffer(OfferFrame& offer, LedgerManager& lm, AccountFrame::pointer account,
-            Asset const& wheat, TrustFrame::pointer wheatLine,
-            Asset const& sheep, TrustFrame::pointer sheepLine)
-{
-    OfferEntry& oe = offer.getOffer();
+    OfferEntry& oe = offer.current().data.offer();
     int64_t maxWheatSend =
-        std::min({oe.amount, canSellAtMost(account, wheat, wheatLine, lm)});
-    int64_t maxSheepReceive = canBuyAtMost(account, sheep, sheepLine, lm);
+        std::min({oe.amount, canSellAtMost(header, account, wheat, wheatLine)});
+    int64_t maxSheepReceive = canBuyAtMost(header, account, sheep, sheepLine);
     oe.amount = adjustOffer(oe.price, maxWheatSend, maxSheepReceive);
 }
 
@@ -880,73 +904,224 @@ int64_t
 adjustOffer(Price const& price, int64_t maxWheatSend, int64_t maxSheepReceive)
 {
     auto res = exchangeV10(price, maxWheatSend, INT64_MAX, INT64_MAX,
-                           maxSheepReceive, false);
+                           maxSheepReceive, RoundingType::NORMAL);
     return res.numWheatReceived;
 }
 
-OfferExchange::CrossOfferResult
-OfferExchange::crossOfferV10(OfferFrame& sellingWheatOffer,
-                             int64_t maxWheatReceived,
-                             int64_t& numWheatReceived, int64_t maxSheepSend,
-                             int64_t& numSheepSend, bool& wheatStays,
-                             bool isPathPayment)
+static ExchangeResultType
+performExchange(LedgerTxnHeader const& header,
+                LedgerTxnEntry const& sellingWheatOffer,
+                ConstLedgerTxnEntry const& accountB,
+                ConstTrustLineWrapper const& wheatLineAccountB,
+                ConstTrustLineWrapper const& sheepLineAccountB,
+                int64_t maxWheatReceived, int64_t& numWheatReceived,
+                int64_t maxSheepSend, int64_t& numSheepSend, int64_t& newAmount)
+{
+    auto const& offer = sellingWheatOffer.current().data.offer();
+    Asset const& sheep = offer.buying;
+    Asset const& wheat = offer.selling;
+    Price const& price = offer.price;
+
+    numWheatReceived = std::min(
+        {canSellAtMostBasedOnSheep(header, sheep, sheepLineAccountB, price),
+         canSellAtMost(header, accountB, wheat, wheatLineAccountB),
+         offer.amount});
+    assert(numWheatReceived >= 0);
+
+    newAmount = numWheatReceived;
+    auto exchangeResult = header.current().ledgerVersion < 3
+                              ? exchangeV2(numWheatReceived, price,
+                                           maxWheatReceived, maxSheepSend)
+                              : exchangeV3(numWheatReceived, price,
+                                           maxWheatReceived, maxSheepSend);
+
+    numWheatReceived = exchangeResult.numWheatReceived;
+    numSheepSend = exchangeResult.numSheepSend;
+
+    bool offerTaken = false;
+    switch (exchangeResult.type())
+    {
+    case ExchangeResultType::REDUCED_TO_ZERO:
+        return ExchangeResultType::REDUCED_TO_ZERO;
+    case ExchangeResultType::BOGUS:
+        // force delete the offer as it represents a bogus offer
+        numWheatReceived = 0;
+        numSheepSend = 0;
+        offerTaken = true;
+        break;
+    default:
+        break;
+    }
+
+    offerTaken = offerTaken || offer.amount <= numWheatReceived;
+    newAmount = offerTaken ? 0 : (newAmount - numWheatReceived);
+    return ExchangeResultType::NORMAL;
+}
+
+static CrossOfferResult
+crossOffer(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
+           int64_t maxWheatReceived, int64_t& numWheatReceived,
+           int64_t maxSheepSend, int64_t& numSheepSend,
+           std::vector<ClaimOfferAtom>& offerTrail)
 {
     assert(maxWheatReceived > 0);
     assert(maxSheepSend > 0);
 
-    // we're about to make changes to the offer
-    mDelta.recordEntry(sellingWheatOffer);
+    auto& offer = sellingWheatOffer.current().data.offer();
+    // Note: These must be copies not references, since they are used even
+    // after sellingWheatOffer may have been erased.
+    Asset sheep = offer.buying;
+    Asset wheat = offer.selling;
+    AccountID accountBID = offer.sellerID;
+    int64_t offerID = offer.offerID;
 
-    Asset& sheep = sellingWheatOffer.getOffer().buying;
-    Asset& wheat = sellingWheatOffer.getOffer().selling;
-    AccountID& accountBID = sellingWheatOffer.getOffer().sellerID;
+    int64_t newAmount = offer.amount;
+    {
+        auto accountB = stellar::loadAccountWithoutRecord(ltx, accountBID);
+        if (!accountB)
+        {
+            throw std::runtime_error(
+                "invalid database state: offer must have matching account");
+        }
 
-    Database& db = mLedgerManager.getDatabase();
+        auto sheepLineAccountB =
+            loadTrustLineWithoutRecordIfNotNative(ltx, accountBID, sheep);
+        auto wheatLineAccountB =
+            loadTrustLineWithoutRecordIfNotNative(ltx, accountBID, wheat);
 
-    AccountFrame::pointer accountB;
-    accountB = AccountFrame::loadAccount(mDelta, accountBID, db);
-    if (!accountB)
+        auto exchangeResult = performExchange(
+            ltx.loadHeader(), sellingWheatOffer, accountB, wheatLineAccountB,
+            sheepLineAccountB, maxWheatReceived, numWheatReceived, maxSheepSend,
+            numSheepSend, newAmount);
+        if (exchangeResult == ExchangeResultType::REDUCED_TO_ZERO)
+        {
+            return CrossOfferResult::eOfferCantConvert;
+        }
+    }
+
+    // Note: No changes have been stored before this point.
+    if (newAmount == 0)
+    { // entire offer is taken
+        sellingWheatOffer.erase();
+        auto accountB = stellar::loadAccount(ltx, accountBID);
+        addNumEntries(ltx.loadHeader(), accountB, -1);
+    }
+    else
+    {
+        offer.amount = newAmount;
+    }
+
+    // Adjust balances
+    if (numSheepSend != 0)
+    {
+        // This LedgerTxn makes it so that we don't record that we loaded
+        // accountB or sheepLineAccountB if we return eOfferCantConvert. We need
+        // a LedgerTxn here since it is possible that changes were already
+        // stored.
+        LedgerTxn ltxInner(ltx);
+        auto header = ltxInner.loadHeader();
+        if (sheep.type() == ASSET_TYPE_NATIVE)
+        {
+            auto accountB = stellar::loadAccount(ltxInner, accountBID);
+            if (!addBalance(header, accountB, numSheepSend))
+            {
+                return CrossOfferResult::eOfferCantConvert;
+            }
+        }
+        else
+        {
+            auto sheepLineAccountB =
+                stellar::loadTrustLine(ltxInner, accountBID, sheep);
+            if (!sheepLineAccountB.addBalance(header, numSheepSend))
+            {
+                return CrossOfferResult::eOfferCantConvert;
+            }
+        }
+        ltxInner.commit();
+    }
+
+    if (numWheatReceived != 0)
+    {
+        // This LedgerTxn makes it so that we don't record that we loaded
+        // accountB or wheatLineAccountB if we return eOfferCantConvert. We need
+        // a LedgerTxn here since it is possible that changes were already
+        // stored.
+        LedgerTxn ltxInner(ltx);
+        auto header = ltxInner.loadHeader();
+        if (wheat.type() == ASSET_TYPE_NATIVE)
+        {
+            auto accountB = stellar::loadAccount(ltxInner, accountBID);
+            if (!addBalance(header, accountB, -numWheatReceived))
+            {
+                return CrossOfferResult::eOfferCantConvert;
+            }
+        }
+        else
+        {
+            auto wheatLineAccountB =
+                stellar::loadTrustLine(ltxInner, accountBID, wheat);
+            if (!wheatLineAccountB.addBalance(header, -numWheatReceived))
+            {
+                return CrossOfferResult::eOfferCantConvert;
+            }
+        }
+        ltxInner.commit();
+    }
+
+    offerTrail.push_back(ClaimOfferAtom(accountBID, offerID, wheat,
+                                        numWheatReceived, sheep, numSheepSend));
+    return (newAmount == 0) ? CrossOfferResult::eOfferTaken
+                            : CrossOfferResult::eOfferPartial;
+}
+
+static CrossOfferResult
+crossOfferV10(AbstractLedgerTxn& ltx, LedgerTxnEntry& sellingWheatOffer,
+              int64_t maxWheatReceived, int64_t& numWheatReceived,
+              int64_t maxSheepSend, int64_t& numSheepSend, bool& wheatStays,
+              RoundingType round, std::vector<ClaimOfferAtom>& offerTrail)
+{
+    assert(maxWheatReceived > 0);
+    assert(maxSheepSend > 0);
+    auto header = ltx.loadHeader();
+
+    auto& offer = sellingWheatOffer.current().data.offer();
+    Asset sheep = offer.buying;
+    Asset wheat = offer.selling;
+    AccountID accountBID = offer.sellerID;
+    int64_t offerID = offer.offerID;
+
+    if (!stellar::loadAccountWithoutRecord(ltx, accountBID))
     {
         throw std::runtime_error(
             "invalid database state: offer must have matching account");
     }
 
-    TrustFrame::pointer wheatLineAccountB;
-    if (wheat.type() != ASSET_TYPE_NATIVE)
-    {
-        wheatLineAccountB =
-            TrustFrame::loadTrustLine(accountBID, wheat, db, &mDelta);
-    }
-
-    TrustFrame::pointer sheepLineAccountB;
-    if (sheep.type() != ASSET_TYPE_NATIVE)
-    {
-        sheepLineAccountB =
-            TrustFrame::loadTrustLine(accountBID, sheep, db, &mDelta);
-    }
-
     // Remove liabilities associated with the offer being crossed.
-    if (mLedgerManager.getCurrentLedgerVersion() >= 10)
+    releaseLiabilities(ltx, header, sellingWheatOffer);
+
+    // Load necessary accounts and trustlines. Note that any LedgerEntry loaded
+    // here was also loaded during releaseLiabilities.
+    LedgerTxnEntry accountB;
+    if (wheat.type() == ASSET_TYPE_NATIVE || sheep.type() == ASSET_TYPE_NATIVE)
     {
-        sellingWheatOffer.releaseLiabilities(accountB, sheepLineAccountB,
-                                             wheatLineAccountB, mDelta, db,
-                                             mLedgerManager);
+        accountB = stellar::loadAccount(ltx, accountBID);
     }
+    auto sheepLineAccountB = loadTrustLineIfNotNative(ltx, accountBID, sheep);
+    auto wheatLineAccountB = loadTrustLineIfNotNative(ltx, accountBID, wheat);
 
     // As of the protocol version 10, this call to adjustOffer should have no
     // effect. We leave it here only as a preventative measure.
-    adjustOffer(sellingWheatOffer, mLedgerManager, accountB, wheat,
-                wheatLineAccountB, sheep, sheepLineAccountB);
+    adjustOffer(header, sellingWheatOffer, accountB, wheat, wheatLineAccountB,
+                sheep, sheepLineAccountB);
 
     int64_t maxWheatSend =
-        canSellAtMost(accountB, wheat, wheatLineAccountB, mLedgerManager);
-    maxWheatSend =
-        std::min({sellingWheatOffer.getOffer().amount, maxWheatSend});
+        canSellAtMost(header, accountB, wheat, wheatLineAccountB);
+    maxWheatSend = std::min({offer.amount, maxWheatSend});
     int64_t maxSheepReceive =
-        canBuyAtMost(accountB, sheep, sheepLineAccountB, mLedgerManager);
-    auto exchangeResult = exchangeV10(
-        sellingWheatOffer.getOffer().price, maxWheatSend, maxWheatReceived,
-        maxSheepSend, maxSheepReceive, isPathPayment);
+        canBuyAtMost(header, accountB, sheep, sheepLineAccountB);
+    auto exchangeResult =
+        exchangeV10(offer.price, maxWheatSend, maxWheatReceived, maxSheepSend,
+                    maxSheepReceive, round);
 
     numWheatReceived = exchangeResult.numWheatReceived;
     numSheepSend = exchangeResult.numSheepSend;
@@ -957,19 +1132,17 @@ OfferExchange::crossOfferV10(OfferFrame& sellingWheatOffer,
     {
         if (sheep.type() == ASSET_TYPE_NATIVE)
         {
-            if (!accountB->addBalance(numSheepSend, mLedgerManager))
+            if (!addBalance(header, accountB, numSheepSend))
             {
                 throw std::runtime_error("overflowed sheep balance");
             }
-            accountB->storeChange(mDelta, db);
         }
         else
         {
-            if (!sheepLineAccountB->addBalance(numSheepSend, mLedgerManager))
+            if (!sheepLineAccountB.addBalance(header, numSheepSend))
             {
                 throw std::runtime_error("overflowed sheep balance");
             }
-            sheepLineAccountB->storeChange(mDelta, db);
         }
     }
 
@@ -977,98 +1150,109 @@ OfferExchange::crossOfferV10(OfferFrame& sellingWheatOffer,
     {
         if (wheat.type() == ASSET_TYPE_NATIVE)
         {
-            if (!accountB->addBalance(-numWheatReceived, mLedgerManager))
+            if (!addBalance(header, accountB, -numWheatReceived))
             {
                 throw std::runtime_error("overflowed wheat balance");
             }
-            accountB->storeChange(mDelta, db);
         }
         else
         {
-            if (!wheatLineAccountB->addBalance(-numWheatReceived,
-                                               mLedgerManager))
+            if (!wheatLineAccountB.addBalance(header, -numWheatReceived))
             {
                 throw std::runtime_error("overflowed wheat balance");
             }
-            wheatLineAccountB->storeChange(mDelta, db);
         }
     }
 
     if (wheatStays)
     {
-        sellingWheatOffer.getOffer().amount -= numWheatReceived;
-        adjustOffer(sellingWheatOffer, mLedgerManager, accountB, wheat,
+        offer.amount -= numWheatReceived;
+        adjustOffer(header, sellingWheatOffer, accountB, wheat,
                     wheatLineAccountB, sheep, sheepLineAccountB);
     }
     else
     {
-        sellingWheatOffer.getOffer().amount = 0;
+        offer.amount = 0;
     }
 
-    if (sellingWheatOffer.getOffer().amount == 0)
+    auto res = (offer.amount == 0) ? CrossOfferResult::eOfferTaken
+                                   : CrossOfferResult::eOfferPartial;
     {
-        sellingWheatOffer.storeDelete(mDelta, db);
-
-        accountB->addNumEntries(-1, mLedgerManager);
-        accountB->storeChange(mDelta, db);
-    }
-    else
-    {
-        if (mLedgerManager.getCurrentLedgerVersion() >= 10)
+        LedgerTxn ltxInner(ltx);
+        header = ltxInner.loadHeader();
+        sellingWheatOffer = loadOffer(ltxInner, accountBID, offerID);
+        if (res == CrossOfferResult::eOfferTaken)
         {
-            sellingWheatOffer.acquireLiabilities(accountB, sheepLineAccountB,
-                                                 wheatLineAccountB, mDelta, db,
-                                                 mLedgerManager);
+            sellingWheatOffer.erase();
+            accountB = stellar::loadAccount(ltxInner, accountBID);
+            addNumEntries(header, accountB, -1);
         }
-        sellingWheatOffer.storeChange(mDelta, db);
+        else
+        {
+            acquireLiabilities(ltxInner, header, sellingWheatOffer);
+        }
+        ltxInner.commit();
     }
 
-    mOfferTrail.push_back(
-        ClaimOfferAtom(accountB->getID(), sellingWheatOffer.getOfferID(), wheat,
-                       numWheatReceived, sheep, numSheepSend));
-
-    return (sellingWheatOffer.getOffer().amount == 0) ? eOfferTaken
-                                                      : eOfferPartial;
+    // Note: The previous block creates a nested LedgerTxn so all entries are
+    // deactivated at this point. Specifically, you cannot use sellingWheatOffer
+    // or offer (which is a reference) since it is not active (and may have been
+    // erased) at this point.
+    offerTrail.push_back(ClaimOfferAtom(accountBID, offerID, wheat,
+                                        numWheatReceived, sheep, numSheepSend));
+    return res;
 }
 
-OfferExchange::ConvertResult
-OfferExchange::convertWithOffers(
-    Asset const& sheep, int64_t maxSheepSend, int64_t& sheepSend,
-    Asset const& wheat, int64_t maxWheatReceive, int64_t& wheatReceived,
-    bool isPathPayment,
-    std::function<OfferFilterResult(OfferFrame const&)> filter)
+ConvertResult
+convertWithOffers(
+    AbstractLedgerTxn& ltxOuter, Asset const& sheep, int64_t maxSheepSend,
+    int64_t& sheepSend, Asset const& wheat, int64_t maxWheatReceive,
+    int64_t& wheatReceived, RoundingType round,
+    std::function<OfferFilterResult(LedgerTxnEntry const&)> filter,
+    std::vector<ClaimOfferAtom>& offerTrail, int64_t maxOffersToCross)
 {
+    // If offerTrail is not empty at the start, then the limit maxOffersToCross
+    // will not be imposed correctly.
+    assert(offerTrail.empty());
+
     sheepSend = 0;
     wheatReceived = 0;
 
-    Database& db = mLedgerManager.getDatabase();
-
     bool needMore = (maxWheatReceive > 0 && maxSheepSend > 0);
-    LoadBestOfferContext context(db, wheat, sheep);
-    OfferFrame::pointer wheatOffer;
-    while (needMore && (wheatOffer = context.loadBestOffer()))
+    while (needMore)
     {
-        if (filter && filter(*wheatOffer) == eStop)
+        LedgerTxn ltx(ltxOuter);
+        auto wheatOffer = ltx.loadBestOffer(sheep, wheat);
+        if (!wheatOffer)
         {
-            return eFilterStop;
+            break;
+        }
+        if (filter && filter(wheatOffer) == OfferFilterResult::eStop)
+        {
+            return ConvertResult::eFilterStop;
+        }
+
+        // Note: maxOffersToCross == INT64_MAX before protocol version 11
+        if (offerTrail.size() >= static_cast<uint64_t>(maxOffersToCross))
+        {
+            return ConvertResult::eCrossedTooMany;
         }
 
         int64_t numWheatReceived;
         int64_t numSheepSend;
-
         CrossOfferResult cor;
-        if (mLedgerManager.getCurrentLedgerVersion() >= 10)
+        if (ltx.loadHeader().current().ledgerVersion >= 10)
         {
             bool wheatStays;
-            cor = crossOfferV10(*wheatOffer, maxWheatReceive, numWheatReceived,
-                                maxSheepSend, numSheepSend, wheatStays,
-                                isPathPayment);
+            cor = crossOfferV10(ltx, wheatOffer, maxWheatReceive,
+                                numWheatReceived, maxSheepSend, numSheepSend,
+                                wheatStays, round, offerTrail);
             needMore = !wheatStays;
         }
         else
         {
-            cor = crossOffer(*wheatOffer, maxWheatReceive, numWheatReceived,
-                             maxSheepSend, numSheepSend);
+            cor = crossOffer(ltx, wheatOffer, maxWheatReceive, numWheatReceived,
+                             maxSheepSend, numSheepSend, offerTrail);
             needMore = true;
         }
 
@@ -1077,16 +1261,11 @@ OfferExchange::convertWithOffers(
         assert(numWheatReceived >= 0);
         assert(numWheatReceived <= maxWheatReceive);
 
-        switch (cor)
+        if (cor == CrossOfferResult::eOfferCantConvert)
         {
-        case eOfferTaken:
-            context.eraseAndUpdate();
-            break;
-        case eOfferPartial:
-            break;
-        case eOfferCantConvert:
-            return ePartial;
+            return ConvertResult::ePartial;
         }
+        ltx.commit();
 
         sheepSend += numSheepSend;
         maxSheepSend -= numSheepSend;
@@ -1097,20 +1276,20 @@ OfferExchange::convertWithOffers(
         needMore = needMore && (maxWheatReceive > 0 && maxSheepSend > 0);
         if (!needMore)
         {
-            return eOK;
+            return ConvertResult::eOK;
         }
-        else if (cor == eOfferPartial)
+        else if (cor == CrossOfferResult::eOfferPartial)
         {
-            return ePartial;
+            return ConvertResult::ePartial;
         }
     }
-    if ((mLedgerManager.getCurrentLedgerVersion() < 10) || !needMore)
+    if ((ltxOuter.loadHeader().current().ledgerVersion < 10) || !needMore)
     {
-        return eOK;
+        return ConvertResult::eOK;
     }
     else
     {
-        return ePartial;
+        return ConvertResult::ePartial;
     }
 }
 }

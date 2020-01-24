@@ -46,21 +46,14 @@ class SCP
         VALID    // the envelope is valid
     };
 
-    enum TriBool
-    {
-        TB_TRUE,
-        TB_FALSE,
-        TB_MAYBE
-    };
-
     // this is the main entry point of the SCP library
     // it processes the envelope, updates the internal state and
     // invokes the appropriate methods
-    EnvelopeState receiveEnvelope(SCPEnvelope const& envelope);
+    EnvelopeState receiveEnvelope(SCPEnvelopeWrapperPtr envelope);
 
     // Submit a value to consider for slotIndex
     // previousValue is the value from slotIndex-1
-    bool nominate(uint64 slotIndex, Value const& value,
+    bool nominate(uint64 slotIndex, ValueWrapperPtr value,
                   Value const& previousValue);
 
     // stops nomination for a slot
@@ -76,12 +69,12 @@ class SCP
     // returns the local node descriptor
     std::shared_ptr<LocalNode> getLocalNode();
 
-    Json::Value getJsonInfo(size_t limit);
+    Json::Value getJsonInfo(size_t limit, bool fullKeys = false);
 
     // summary: only return object counts
     // index = 0 for returning information for all slots
     Json::Value getJsonQuorumInfo(NodeID const& id, bool summary,
-                                  uint64 index = 0);
+                                  bool fullKeys = false, uint64 index = 0);
 
     // Purges all data relative to all the slots whose slotIndex is smaller
     // than the specified `maxSlotIndex`.
@@ -89,6 +82,9 @@ class SCP
 
     // Returns whether the local node is a validator.
     bool isValidator();
+
+    // returns the validation state of the given slot
+    bool isSlotFullyValidated(uint64 slotIndex);
 
     // Helpers for monitoring and reporting the internal memory-usage of the SCP
     // protocol to system metric reporters.
@@ -100,35 +96,37 @@ class SCP
 
     // forces the state to match the one in the envelope
     // this is used when rebuilding the state after a crash for example
-    void setStateFromEnvelope(uint64 slotIndex, SCPEnvelope const& e);
+    void setStateFromEnvelope(uint64 slotIndex, SCPEnvelopeWrapperPtr e);
 
     // check if we are holding some slots
     bool empty() const;
-    // return lowest slot index value
-    uint64 getLowSlotIndex() const;
-    // return highest slot index value
-    uint64 getHighSlotIndex() const;
 
-    // returns all messages for the slot
-    std::vector<SCPEnvelope> getCurrentState(uint64 slotIndex);
+    // invokes f for all latest messages
+    // if forceSelf, return messages for self even if not fully validated
+    // f returns false to stop processing, true otherwise
+    void processCurrentState(uint64 slotIndex,
+                             std::function<bool(SCPEnvelope const&)> const& f,
+                             bool forceSelf);
+
+    // iterates through slots, starting from ledgerSeq
+    void processSlotsAscendingFrom(uint64 startIndex,
+                                   std::function<bool(uint64)> const& f);
+
+    // returns the latest message from a node
+    // or nullptr if not found
+    SCPEnvelope const* getLatestMessage(NodeID const& id);
 
     // returns messages that contributed to externalizing the slot
     // (or empty if the slot didn't externalize)
     std::vector<SCPEnvelope> getExternalizingState(uint64 slotIndex);
 
-    // returns if a node is in the (transitive) quorum originating at
-    // the local node, scanning the known slots.
-    // TB_TRUE iff n is in the quorum
-    // TB_FALSE iff n is not in the quorum
-    // TB_MAYBE iff the quorum cannot be computed
-    TriBool isNodeInQuorum(NodeID const& node);
-
     // ** helper methods to stringify ballot for logging
     std::string getValueString(Value const& v) const;
     std::string ballotToStr(SCPBallot const& ballot) const;
     std::string ballotToStr(std::unique_ptr<SCPBallot> const& ballot) const;
-    std::string envToStr(SCPEnvelope const& envelope) const;
-    std::string envToStr(SCPStatement const& st) const;
+    std::string envToStr(SCPEnvelope const& envelope,
+                         bool fullKeys = false) const;
+    std::string envToStr(SCPStatement const& st, bool fullKeys = false) const;
 
   protected:
     std::shared_ptr<LocalNode> mLocalNode;

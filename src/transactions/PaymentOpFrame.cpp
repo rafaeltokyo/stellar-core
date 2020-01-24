@@ -4,18 +4,11 @@
 
 #include "util/asio.h"
 #include "transactions/PaymentOpFrame.h"
-#include "OfferExchange.h"
-#include "database/Database.h"
-#include "ledger/LedgerDelta.h"
-#include "ledger/OfferFrame.h"
-#include "ledger/TrustFrame.h"
-#include "main/Application.h"
-#include "medida/meter.h"
-#include "medida/metrics_registry.h"
-#include "transactions/PathPaymentOpFrame.h"
-#include "util/Logging.h"
-#include "util/XDROperators.h"
-#include <algorithm>
+#include "ledger/LedgerTxn.h"
+#include "ledger/LedgerTxnEntry.h"
+#include "ledger/LedgerTxnHeader.h"
+#include "transactions/PathPaymentStrictReceiveOpFrame.h"
+#include "transactions/TransactionUtils.h"
 
 namespace stellar
 {
@@ -29,21 +22,18 @@ PaymentOpFrame::PaymentOpFrame(Operation const& op, OperationResult& res,
 }
 
 bool
-PaymentOpFrame::doApply(Application& app, LedgerDelta& delta,
-                        LedgerManager& ledgerManager)
+PaymentOpFrame::doApply(AbstractLedgerTxn& ltx)
 {
     // if sending to self XLM directly, just mark as success, else we need at
     // least to check trustlines
     // in ledger version 2 it would work for any asset type
-    auto instantSuccess = app.getLedgerManager().getCurrentLedgerVersion() > 2
+    auto ledgerVersion = ltx.loadHeader().current().ledgerVersion;
+    auto instantSuccess = ledgerVersion > 2
                               ? mPayment.destination == getSourceID() &&
                                     mPayment.asset.type() == ASSET_TYPE_NATIVE
                               : mPayment.destination == getSourceID();
     if (instantSuccess)
     {
-        app.getMetrics()
-            .NewMeter({"op-payment", "success", "apply"}, "operation")
-            .Mark();
         innerResult().code(PAYMENT_SUCCESS);
         return true;
     }
@@ -51,8 +41,8 @@ PaymentOpFrame::doApply(Application& app, LedgerDelta& delta,
     // build a pathPaymentOp
     Operation op;
     op.sourceAccount = mOperation.sourceAccount;
-    op.body.type(PATH_PAYMENT);
-    PathPaymentOp& ppOp = op.body.pathPaymentOp();
+    op.body.type(PATH_PAYMENT_STRICT_RECEIVE);
+    PathPaymentStrictReceiveOp& ppOp = op.body.pathPaymentStrictReceiveOp();
     ppOp.sendAsset = mPayment.asset;
     ppOp.destAsset = mPayment.asset;
 
@@ -63,112 +53,92 @@ PaymentOpFrame::doApply(Application& app, LedgerDelta& delta,
 
     OperationResult opRes;
     opRes.code(opINNER);
-    opRes.tr().type(PATH_PAYMENT);
-    PathPaymentOpFrame ppayment(op, opRes, mParentTx);
-    ppayment.setSourceAccountPtr(mSourceAccount);
+    opRes.tr().type(PATH_PAYMENT_STRICT_RECEIVE);
+    PathPaymentStrictReceiveOpFrame ppayment(op, opRes, mParentTx);
 
-    if (!ppayment.doCheckValid(app) ||
-        !ppayment.doApply(app, delta, ledgerManager))
+    if (!ppayment.doCheckValid(ledgerVersion) || !ppayment.doApply(ltx))
     {
         if (ppayment.getResultCode() != opINNER)
         {
-            throw std::runtime_error("Unexpected error code from pathPayment");
+            throw std::runtime_error(
+                "Unexpected error code from pathPaymentStrictReceive");
         }
         PaymentResultCode res;
 
-        switch (PathPaymentOpFrame::getInnerCode(ppayment.getResult()))
+        switch (
+            PathPaymentStrictReceiveOpFrame::getInnerCode(ppayment.getResult()))
         {
-        case PATH_PAYMENT_UNDERFUNDED:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "underfunded"}, "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_UNDERFUNDED:
             res = PAYMENT_UNDERFUNDED;
             break;
-        case PATH_PAYMENT_SRC_NOT_AUTHORIZED:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "src-not-authorized"},
-                          "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_SRC_NOT_AUTHORIZED:
             res = PAYMENT_SRC_NOT_AUTHORIZED;
             break;
-        case PATH_PAYMENT_SRC_NO_TRUST:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "src-no-trust"},
-                          "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_SRC_NO_TRUST:
             res = PAYMENT_SRC_NO_TRUST;
             break;
-        case PATH_PAYMENT_NO_DESTINATION:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "no-destination"},
-                          "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_NO_DESTINATION:
             res = PAYMENT_NO_DESTINATION;
             break;
-        case PATH_PAYMENT_NO_TRUST:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "no-trust"}, "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_NO_TRUST:
             res = PAYMENT_NO_TRUST;
             break;
-        case PATH_PAYMENT_NOT_AUTHORIZED:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "not-authorized"},
-                          "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_NOT_AUTHORIZED:
             res = PAYMENT_NOT_AUTHORIZED;
             break;
-        case PATH_PAYMENT_LINE_FULL:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "line-full"}, "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_LINE_FULL:
             res = PAYMENT_LINE_FULL;
             break;
-        case PATH_PAYMENT_NO_ISSUER:
-            app.getMetrics()
-                .NewMeter({"op-payment", "failure", "no-issuer"}, "operation")
-                .Mark();
+        case PATH_PAYMENT_STRICT_RECEIVE_NO_ISSUER:
             res = PAYMENT_NO_ISSUER;
             break;
         default:
-            throw std::runtime_error("Unexpected error code from pathPayment");
+            throw std::runtime_error(
+                "Unexpected error code from pathPaymentStrictReceive");
         }
         innerResult().code(res);
         return false;
     }
 
-    assert(PathPaymentOpFrame::getInnerCode(ppayment.getResult()) ==
-           PATH_PAYMENT_SUCCESS);
+    assert(PathPaymentStrictReceiveOpFrame::getInnerCode(
+               ppayment.getResult()) == PATH_PAYMENT_STRICT_RECEIVE_SUCCESS);
 
-    app.getMetrics()
-        .NewMeter({"op-payment", "success", "apply"}, "operation")
-        .Mark();
     innerResult().code(PAYMENT_SUCCESS);
 
     return true;
 }
 
 bool
-PaymentOpFrame::doCheckValid(Application& app)
+PaymentOpFrame::doCheckValid(uint32_t ledgerVersion)
 {
     if (mPayment.amount <= 0)
     {
-        app.getMetrics()
-            .NewMeter({"op-payment", "invalid", "malformed-negative-amount"},
-                      "operation")
-            .Mark();
         innerResult().code(PAYMENT_MALFORMED);
         return false;
     }
     if (!isAssetValid(mPayment.asset))
     {
-        app.getMetrics()
-            .NewMeter({"op-payment", "invalid", "malformed-invalid-asset"},
-                      "operation")
-            .Mark();
         innerResult().code(PAYMENT_MALFORMED);
         return false;
     }
     return true;
+}
+
+void
+PaymentOpFrame::insertLedgerKeysToPrefetch(
+    std::unordered_set<LedgerKey>& keys) const
+{
+    keys.emplace(accountKey(mPayment.destination));
+
+    // Prefetch issuer for non-native assets
+    if (mPayment.asset.type() != ASSET_TYPE_NATIVE)
+    {
+        auto issuer = getIssuer(mPayment.asset);
+        keys.emplace(accountKey(issuer));
+
+        // These are *maybe* needed; For now, we load everything
+        keys.emplace(trustlineKey(mPayment.destination, mPayment.asset));
+        keys.emplace(trustlineKey(getSourceID(), mPayment.asset));
+    }
 }
 }

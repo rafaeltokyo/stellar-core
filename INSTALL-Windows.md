@@ -4,21 +4,19 @@
 * try Settings -> System -> About and look under System Type
 * When in doubt, see http://www.tenforums.com/tutorials/4399-system-type-32-bit-x86-64-bit-x64-windows-10-a.html
 
-## Download and install `Visual Studio 2017` (for Visual C++) ; the Community Edition is free and fully functional.
+## Download and install `Visual Studio 2019` (for Visual C++) ; the Community Edition is free and fully functional.
 * See https://www.visualstudio.com/downloads/
 * When installing, you will need to select:
     * Desktop Development with C++
     * C++ Profiling (optional)
-    * Windows 8.1 SDK
-    * Visual C++ tools for Cmake
-    * Visual C++ ATL Support
+    * Windows 10 SDK
     * C++/CLI Support
 
 ## Download and install PostgreSQL
 
 Note: if you do not want to use postgres you can select `DebugNoPostgres` as the build target.
 
-Get version 9.4.8 from https://www.enterprisedb.com/download-postgresql-binaries
+Get version 9.5 from https://www.enterprisedb.com/download-postgresql-binaries
 
 The default project file defines USE_POSTGRES and links against it.
 * Pick a directory for the database
@@ -26,7 +24,7 @@ The default project file defines USE_POSTGRES and links against it.
 * Accept the default port (5432)
 * Accept `default` for the locale (not clear if anything depends on this. The `default` locale will
 presumably depend on your operating system's setting might cause inconsistencies)
-* Add `c:\Program Files\PostgreSQL\9.4\bin` to your PATH (else the binary will fail to start,
+* Add `c:\Program Files\PostgreSQL\9.5\bin` to your PATH (else the binary will fail to start,
     not finding `libpq.dll`)
 * If you install postgres in a different folder, you will have to update the project file in two places:
     * "additional include locations" and

@@ -11,14 +11,12 @@ namespace stellar
 namespace decoder
 {
 
-inline size_t
-encoded_size32(size_t rawsize)
+inline size_t constexpr encoded_size32(size_t rawsize)
 {
     return ((rawsize + 4) / 5 * 8);
 }
 
-inline size_t
-encoded_size64(size_t rawsize)
+inline size_t constexpr encoded_size64(size_t rawsize)
 {
     return ((rawsize + 2) / 3 * 4);
 }
@@ -28,7 +26,7 @@ inline std::string
 encode_b32(T const& v)
 {
     std::string res;
-    res.reserve(encoded_size64(v.size() * sizeof(typename T::value_type)) + 1);
+    res.reserve(encoded_size32(v.size() * sizeof(typename T::value_type)) + 1);
     bn::encode_b32(v.begin(), v.end(), std::back_inserter(res));
     return res;
 }

@@ -4,11 +4,11 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
+#include "database/DatabaseTypeSpecificOperation.h"
 #include "medida/timer_context.h"
 #include "overlay/StellarXDR.h"
 #include "util/NonCopyable.h"
 #include "util/Timer.h"
-#include "util/lrucache.hpp"
 #include <set>
 #include <soci.h>
 #include <string>
@@ -16,7 +16,6 @@
 namespace medida
 {
 class Meter;
-class Timer;
 class Counter;
 }
 
@@ -92,9 +91,6 @@ class Database : NonMovableOrCopyable
     std::map<std::string, std::shared_ptr<soci::statement>> mStatements;
     medida::Counter& mStatementsSize;
 
-    cache::lru_cache<std::string, std::shared_ptr<LedgerEntry const>>
-        mEntryCache;
-
     // Helpers for maintaining the total query time and calculating
     // idle percentage.
     std::set<std::string> mEntityTypes;
@@ -138,7 +134,7 @@ class Database : NonMovableOrCopyable
 
     // Return a helper object that borrows, from the Database, a prepared
     // statement handle for the provided query. The prepared statement handle
-    // is ceated if necessary before borrowing, and reset (unbound from data)
+    // is created if necessary before borrowing, and reset (unbound from data)
     // when the statement context is destroyed.
     StatementContext getPreparedStatement(std::string const& query);
 
@@ -153,6 +149,7 @@ class Database : NonMovableOrCopyable
     medida::TimerContext getSelectTimer(std::string const& entityName);
     medida::TimerContext getDeleteTimer(std::string const& entityName);
     medida::TimerContext getUpdateTimer(std::string const& entityName);
+    medida::TimerContext getUpsertTimer(std::string const& entityName);
 
     // If possible (i.e. "on postgres") issue an SQL pragma that marks
     // the current transaction as read-only. The effects of this last
@@ -162,12 +159,23 @@ class Database : NonMovableOrCopyable
     // Return true if the Database target is SQLite, otherwise false.
     bool isSqlite() const;
 
+    // Return an optional SQL COLLATION clause to use for text-typed columns in
+    // this database, in order to ensure they're compared "simply" using
+    // byte-value comparisons, i.e. in a non-language-sensitive fashion.  For
+    // Postgresql this will be 'COLLATE "C"' and for SQLite, nothing (its
+    // defaults are correct already).
+    std::string getSimpleCollationClause() const;
+
+    // Call `op` back with the specific database backend subtype in use.
+    template <typename T>
+    T doDatabaseTypeSpecificOperation(DatabaseTypeSpecificOperation<T>& op);
+
     // Return true if a connection pool is available for worker threads
     // to read from the database through, otherwise false.
     bool canUsePool() const;
 
     // Drop and recreate all tables in the database target. This is called
-    // by the --newdb command-line flag on stellar-core.
+    // by the new-db command on stellar-core.
     void initialize();
 
     // Save `vers` as schema version.
@@ -188,14 +196,29 @@ class Database : NonMovableOrCopyable
     // Access the optional SOCI connection pool available for worker
     // threads. Throws an error if !canUsePool().
     soci::connection_pool& getPool();
-
-    // Access the LedgerEntry cache. Note: clients are responsible for
-    // invalidating entries in this cache as they perform statements
-    // against the database. It's kept here only for ease of access.
-    typedef cache::lru_cache<std::string, std::shared_ptr<LedgerEntry const>>
-        EntryCache;
-    EntryCache& getEntryCache();
 };
+
+template <typename T>
+T
+Database::doDatabaseTypeSpecificOperation(DatabaseTypeSpecificOperation<T>& op)
+{
+    auto b = mSession.get_backend();
+    if (auto sq = dynamic_cast<soci::sqlite3_session_backend*>(b))
+    {
+        return op.doSqliteSpecificOperation(sq);
+#ifdef USE_POSTGRES
+    }
+    else if (auto pg = dynamic_cast<soci::postgresql_session_backend*>(b))
+    {
+        return op.doPostgresSpecificOperation(pg);
+#endif
+    }
+    else
+    {
+        // Extend this with other cases if we support more databases.
+        abort();
+    }
+}
 
 class DBTimeExcluder : NonCopyable
 {

@@ -6,55 +6,74 @@
 #include "database/Database.h"
 #include "history/StateSnapshot.h"
 #include "historywork/Progress.h"
-#include "ledger/LedgerHeaderFrame.h"
 #include "main/Application.h"
 #include "util/XDRStream.h"
 
 namespace stellar
 {
 
-WriteSnapshotWork::WriteSnapshotWork(Application& app, WorkParent& parent,
+// Note, WriteSnapshotWork does not have any special retry clean-up logic:
+// history items are written via XDROutputFileStream, which automatically
+// truncates any existing files.
+WriteSnapshotWork::WriteSnapshotWork(Application& app,
                                      std::shared_ptr<StateSnapshot> snapshot)
-    : Work(app, parent, "write-snapshot", Work::RETRY_A_LOT)
+    : BasicWork(app, "write-snapshot", BasicWork::RETRY_A_LOT)
     , mSnapshot(snapshot)
 {
 }
 
-WriteSnapshotWork::~WriteSnapshotWork()
+BasicWork::State
+WriteSnapshotWork::onRun()
 {
-    clearChildren();
-}
+    if (mDone)
+    {
+        return mSuccess ? State::WORK_SUCCESS : State::WORK_FAILURE;
+    }
 
-void
-WriteSnapshotWork::onStart()
-{
-    auto handler = callComplete();
-    auto snap = mSnapshot;
-    auto work = [handler, snap]() {
-        asio::error_code ec;
+    std::weak_ptr<WriteSnapshotWork> weak(
+        std::static_pointer_cast<WriteSnapshotWork>(shared_from_this()));
+
+    auto work = [weak]() {
+        auto self = weak.lock();
+        if (!self)
+        {
+            return;
+        }
+
+        auto snap = self->mSnapshot;
+        bool success = true;
         if (!snap->writeHistoryBlocks())
         {
-            ec = std::make_error_code(std::errc::io_error);
+            success = false;
         }
-        snap->mApp.getClock().getIOService().post(
-            [handler, ec]() { handler(ec); });
+
+        // Not ideal, but needed to prevent race conditions with
+        // main thread, since BasicWork's state is not thread-safe. This is a
+        // temporary workaround, as a cleaner solution is needed.
+        self->mApp.postOnMainThread(
+            [weak, success]() {
+                auto self = weak.lock();
+                if (self)
+                {
+                    self->mDone = true;
+                    self->mSuccess = success;
+                    self->wakeUp();
+                }
+            },
+            "WriteSnapshotWork: finish");
     };
 
     // Throw the work over to a worker thread if we can use DB pools,
     // otherwise run on main thread.
     if (mApp.getDatabase().canUsePool())
     {
-        mApp.getWorkerIOService().post(work);
+        mApp.postOnBackgroundThread(work, "WriteSnapshotWork: start");
+        return State::WORK_WAITING;
     }
     else
     {
         work();
+        return State::WORK_RUNNING;
     }
-}
-
-void
-WriteSnapshotWork::onRun()
-{
-    // Do nothing: we spawned the writer in onStart().
 }
 }

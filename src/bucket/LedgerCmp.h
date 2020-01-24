@@ -4,7 +4,6 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "ledger/EntryFrame.h"
 #include "overlay/StellarXDR.h"
 #include "util/XDROperators.h"
 
@@ -100,26 +99,47 @@ struct BucketEntryIdCmp
         BucketEntryType aty = a.type();
         BucketEntryType bty = b.type();
 
-        if (aty == LIVEENTRY)
+        // METAENTRY sorts below all other entries, comes first in buckets.
+        if (aty == METAENTRY || bty == METAENTRY)
         {
-            if (bty == LIVEENTRY)
+            return aty < bty;
+        }
+
+        if (aty == LIVEENTRY || aty == INITENTRY)
+        {
+            if (bty == LIVEENTRY || bty == INITENTRY)
             {
                 return LedgerEntryIdCmp{}(a.liveEntry().data,
                                           b.liveEntry().data);
             }
             else
             {
+                if (bty != DEADENTRY)
+                {
+                    throw std::runtime_error("Malformed bucket: unexpected "
+                                             "non-INIT/LIVE/DEAD entry.");
+                }
                 return LedgerEntryIdCmp{}(a.liveEntry().data, b.deadEntry());
             }
         }
         else
         {
-            if (bty == LIVEENTRY)
+            if (aty != DEADENTRY)
+            {
+                throw std::runtime_error(
+                    "Malformed bucket: unexpected non-INIT/LIVE/DEAD entry.");
+            }
+            if (bty == LIVEENTRY || bty == INITENTRY)
             {
                 return LedgerEntryIdCmp{}(a.deadEntry(), b.liveEntry().data);
             }
             else
             {
+                if (bty != DEADENTRY)
+                {
+                    throw std::runtime_error("Malformed bucket: unexpected "
+                                             "non-INIT/LIVE/DEAD entry.");
+                }
                 return LedgerEntryIdCmp{}(a.deadEntry(), b.deadEntry());
             }
         }

@@ -4,13 +4,19 @@
 
 #include "invariant/LedgerEntryIsValid.h"
 #include "invariant/InvariantManager.h"
-#include "ledger/LedgerDelta.h"
+#include "ledger/LedgerTxn.h"
 #include "lib/util/format.h"
 #include "main/Application.h"
 #include "xdrpp/printer.h"
 
 namespace stellar
 {
+
+static bool
+signerCompare(Signer const& s1, Signer const& s2)
+{
+    return s1.key < s2.key;
+}
 
 LedgerEntryIsValid::LedgerEntryIsValid() : Invariant(false)
 {
@@ -31,27 +37,28 @@ LedgerEntryIsValid::getName() const
 std::string
 LedgerEntryIsValid::checkOnOperationApply(Operation const& operation,
                                           OperationResult const& result,
-                                          LedgerDelta const& delta)
+                                          LedgerTxnDelta const& ltxDelta)
 {
-    uint32_t currLedgerSeq = delta.getHeader().ledgerSeq;
+    uint32_t currLedgerSeq = ltxDelta.header.current.ledgerSeq;
     if (currLedgerSeq > INT32_MAX)
     {
         return fmt::format("LedgerHeader ledgerSeq ({}) exceeds limits ({})",
                            currLedgerSeq, INT32_MAX);
     }
 
-    std::string msg =
-        check(delta.added().begin(), delta.added().end(), currLedgerSeq);
-    if (!msg.empty())
+    auto ver = ltxDelta.header.current.ledgerVersion;
+    for (auto const& entryDelta : ltxDelta.entry)
     {
-        return msg;
-    }
+        if (!entryDelta.second.current)
+            continue;
 
-    msg =
-        check(delta.modified().begin(), delta.modified().end(), currLedgerSeq);
-    if (!msg.empty())
-    {
-        return msg;
+        auto s = checkIsValid(*entryDelta.second.current, currLedgerSeq, ver);
+        if (!s.empty())
+        {
+            s += ": ";
+            s += xdr::xdr_to_string(*entryDelta.second.current);
+            return s;
+        }
     }
     return {};
 }
@@ -59,11 +66,11 @@ LedgerEntryIsValid::checkOnOperationApply(Operation const& operation,
 template <typename IterType>
 std::string
 LedgerEntryIsValid::check(IterType iter, IterType const& end,
-                          uint32_t ledgerSeq) const
+                          uint32_t ledgerSeq, uint32 version) const
 {
     for (; iter != end; ++iter)
     {
-        auto s = checkIsValid(iter->current->mEntry, ledgerSeq);
+        auto s = checkIsValid(iter->current->mEntry, ledgerSeq, version);
         if (!s.empty())
         {
             s += ": ";
@@ -75,8 +82,8 @@ LedgerEntryIsValid::check(IterType iter, IterType const& end,
 }
 
 std::string
-LedgerEntryIsValid::checkIsValid(LedgerEntry const& le,
-                                 uint32_t ledgerSeq) const
+LedgerEntryIsValid::checkIsValid(LedgerEntry const& le, uint32_t ledgerSeq,
+                                 uint32 version) const
 {
     if (le.lastModifiedLedgerSeq != ledgerSeq)
     {
@@ -87,20 +94,20 @@ LedgerEntryIsValid::checkIsValid(LedgerEntry const& le,
     switch (le.data.type())
     {
     case ACCOUNT:
-        return checkIsValid(le.data.account());
+        return checkIsValid(le.data.account(), version);
     case TRUSTLINE:
-        return checkIsValid(le.data.trustLine());
+        return checkIsValid(le.data.trustLine(), version);
     case OFFER:
-        return checkIsValid(le.data.offer());
+        return checkIsValid(le.data.offer(), version);
     case DATA:
-        return checkIsValid(le.data.data());
+        return checkIsValid(le.data.data(), version);
     default:
         return "LedgerEntry has invalid type";
     }
 }
 
 std::string
-LedgerEntryIsValid::checkIsValid(AccountEntry const& ae) const
+LedgerEntryIsValid::checkIsValid(AccountEntry const& ae, uint32 version) const
 {
     if (ae.balance < 0)
     {
@@ -125,22 +132,26 @@ LedgerEntryIsValid::checkIsValid(AccountEntry const& ae) const
     }
     if (std::adjacent_find(ae.signers.begin(), ae.signers.end(),
                            [](Signer const& s1, Signer const& s2) {
-                               return !AccountFrame::signerCompare(s1, s2);
+                               return !signerCompare(s1, s2);
                            }) != ae.signers.end())
     {
         return "Account signers are not strictly increasing";
     }
-    if (!std::all_of(ae.signers.begin(), ae.signers.end(), [](Signer const& s) {
-            return (s.weight <= UINT8_MAX) && (s.weight != 0);
-        }))
+    if (version > 9)
     {
-        return "Account signers have invalid weights";
+        if (!std::all_of(ae.signers.begin(), ae.signers.end(),
+                         [](Signer const& s) {
+                             return (s.weight <= UINT8_MAX) && (s.weight != 0);
+                         }))
+        {
+            return "Account signers have invalid weights";
+        }
     }
     return {};
 }
 
 std::string
-LedgerEntryIsValid::checkIsValid(TrustLineEntry const& tl) const
+LedgerEntryIsValid::checkIsValid(TrustLineEntry const& tl, uint32 version) const
 {
     if (tl.asset.type() == ASSET_TYPE_NATIVE)
     {
@@ -171,12 +182,11 @@ LedgerEntryIsValid::checkIsValid(TrustLineEntry const& tl) const
 }
 
 std::string
-LedgerEntryIsValid::checkIsValid(OfferEntry const& oe) const
+LedgerEntryIsValid::checkIsValid(OfferEntry const& oe, uint32 version) const
 {
-    if (oe.offerID > INT64_MAX)
+    if (oe.offerID <= 0)
     {
-        return fmt::format("Offer offerID ({}) exceeds limit ({})", oe.offerID,
-                           INT64_MAX);
+        return fmt::format("Offer offerID ({}) must be positive", oe.offerID);
     }
     if (!isAssetValid(oe.selling))
     {
@@ -203,7 +213,7 @@ LedgerEntryIsValid::checkIsValid(OfferEntry const& oe) const
 }
 
 std::string
-LedgerEntryIsValid::checkIsValid(DataEntry const& de) const
+LedgerEntryIsValid::checkIsValid(DataEntry const& de, uint32 version) const
 {
     if (de.dataName.size() == 0)
     {

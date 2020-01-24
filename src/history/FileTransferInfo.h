@@ -25,7 +25,7 @@ class FileTransferInfo
     std::string mType;
     std::string mHexDigits;
     std::string mLocalPath;
-    std::string mSuffix;
+    std::string getLocalDir(TmpDir const& localRoot) const;
 
   public:
     FileTransferInfo(Bucket const& bucket)
@@ -39,7 +39,7 @@ class FileTransferInfo
                      uint32_t checkpointLedger)
         : mType(snapType)
         , mHexDigits(fs::hexStr(checkpointLedger))
-        , mLocalPath(snapDir.getName() + "/" + baseName_nogz())
+        , mLocalPath(getLocalDir(snapDir) + "/" + baseName_nogz())
     {
     }
 
@@ -47,19 +47,14 @@ class FileTransferInfo
                      std::string const& hexDigits)
         : mType(snapType)
         , mHexDigits(hexDigits)
-        , mLocalPath(snapDir.getName() + "/" + baseName_nogz())
+        , mLocalPath(getLocalDir(snapDir) + "/" + baseName_nogz())
     {
     }
 
-    bool
-    getBucketHashName(std::string& hash) const
+    std::string
+    getType() const
     {
-        if (mHexDigits.size() == 64 && mType == HISTORY_FILE_TYPE_BUCKET)
-        {
-            hash = mHexDigits;
-            return true;
-        }
-        return false;
+        return mType;
     }
 
     std::string

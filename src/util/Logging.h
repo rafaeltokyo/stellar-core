@@ -13,8 +13,11 @@
 #define ELPP_WINSOCK2
 #define ELPP_DEBUG_ERRORS
 
-// NOTE: Nothing else should include easylogging directly
-//  include this file instead
+// NOTE: Nothing else should include easylogging directly include this file
+// instead Please think carefully modifying this file, and potentially using
+// synchronization primitives. It is easy to introduce data races and deadlocks,
+// so it is recommended to use valgrind --tool=helgrind to detect potential
+// problems.
 #include "lib/util/easylogging++.h"
 
 namespace stellar
@@ -34,5 +37,9 @@ class Logging
     static bool logDebug(std::string const& partition);
     static bool logTrace(std::string const& partition);
     static void rotate();
+    // throws if partition name is not recognized
+    static std::string normalizePartition(std::string const& partition);
+
+    static std::array<std::string const, 14> const kPartitionNames;
 };
 }

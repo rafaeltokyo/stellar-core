@@ -61,35 +61,35 @@ throwIf(PaymentResult const& result)
 }
 
 void
-throwIf(PathPaymentResult const& result)
+throwIf(PathPaymentStrictReceiveResult const& result)
 {
     switch (result.code())
     {
-    case PATH_PAYMENT_MALFORMED:
-        throw ex_PATH_PAYMENT_MALFORMED{};
-    case PATH_PAYMENT_UNDERFUNDED:
-        throw ex_PATH_PAYMENT_UNDERFUNDED{};
-    case PATH_PAYMENT_SRC_NO_TRUST:
-        throw ex_PATH_PAYMENT_SRC_NO_TRUST{};
-    case PATH_PAYMENT_SRC_NOT_AUTHORIZED:
-        throw ex_PATH_PAYMENT_SRC_NOT_AUTHORIZED{};
-    case PATH_PAYMENT_NO_DESTINATION:
-        throw ex_PATH_PAYMENT_NO_DESTINATION{};
-    case PATH_PAYMENT_NO_TRUST:
-        throw ex_PATH_PAYMENT_NO_TRUST{};
-    case PATH_PAYMENT_NOT_AUTHORIZED:
-        throw ex_PATH_PAYMENT_NOT_AUTHORIZED{};
-    case PATH_PAYMENT_LINE_FULL:
-        throw ex_PATH_PAYMENT_LINE_FULL{};
-    case PATH_PAYMENT_NO_ISSUER:
-        throw ex_PATH_PAYMENT_NO_ISSUER{};
-    case PATH_PAYMENT_TOO_FEW_OFFERS:
-        throw ex_PATH_PAYMENT_TOO_FEW_OFFERS{};
-    case PATH_PAYMENT_OFFER_CROSS_SELF:
-        throw ex_PATH_PAYMENT_OFFER_CROSS_SELF{};
-    case PATH_PAYMENT_OVER_SENDMAX:
-        throw ex_PATH_PAYMENT_OVER_SENDMAX{};
-    case PATH_PAYMENT_SUCCESS:
+    case PATH_PAYMENT_STRICT_RECEIVE_MALFORMED:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_MALFORMED{};
+    case PATH_PAYMENT_STRICT_RECEIVE_UNDERFUNDED:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_UNDERFUNDED{};
+    case PATH_PAYMENT_STRICT_RECEIVE_SRC_NO_TRUST:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_SRC_NO_TRUST{};
+    case PATH_PAYMENT_STRICT_RECEIVE_SRC_NOT_AUTHORIZED:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_SRC_NOT_AUTHORIZED{};
+    case PATH_PAYMENT_STRICT_RECEIVE_NO_DESTINATION:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_NO_DESTINATION{};
+    case PATH_PAYMENT_STRICT_RECEIVE_NO_TRUST:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_NO_TRUST{};
+    case PATH_PAYMENT_STRICT_RECEIVE_NOT_AUTHORIZED:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_NOT_AUTHORIZED{};
+    case PATH_PAYMENT_STRICT_RECEIVE_LINE_FULL:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_LINE_FULL{};
+    case PATH_PAYMENT_STRICT_RECEIVE_NO_ISSUER:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_NO_ISSUER{};
+    case PATH_PAYMENT_STRICT_RECEIVE_TOO_FEW_OFFERS:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_TOO_FEW_OFFERS{};
+    case PATH_PAYMENT_STRICT_RECEIVE_OFFER_CROSS_SELF:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_OFFER_CROSS_SELF{};
+    case PATH_PAYMENT_STRICT_RECEIVE_OVER_SENDMAX:
+        throw ex_PATH_PAYMENT_STRICT_RECEIVE_OVER_SENDMAX{};
+    case PATH_PAYMENT_STRICT_RECEIVE_SUCCESS:
         break;
     default:
         throw ex_UNKNOWN{};
@@ -97,35 +97,107 @@ throwIf(PathPaymentResult const& result)
 }
 
 void
-throwIf(ManageOfferResult const& result)
+throwIf(PathPaymentStrictSendResult const& result)
 {
     switch (result.code())
     {
-    case MANAGE_OFFER_MALFORMED:
-        throw ex_MANAGE_OFFER_MALFORMED{};
-    case MANAGE_OFFER_SELL_NO_TRUST:
-        throw ex_MANAGE_OFFER_SELL_NO_TRUST{};
-    case MANAGE_OFFER_BUY_NO_TRUST:
-        throw ex_MANAGE_OFFER_BUY_NO_TRUST{};
-    case MANAGE_OFFER_SELL_NOT_AUTHORIZED:
-        throw ex_MANAGE_OFFER_SELL_NOT_AUTHORIZED{};
-    case MANAGE_OFFER_BUY_NOT_AUTHORIZED:
-        throw ex_MANAGE_OFFER_BUY_NOT_AUTHORIZED{};
-    case MANAGE_OFFER_LINE_FULL:
-        throw ex_MANAGE_OFFER_LINE_FULL{};
-    case MANAGE_OFFER_UNDERFUNDED:
-        throw ex_MANAGE_OFFER_UNDERFUNDED{};
-    case MANAGE_OFFER_CROSS_SELF:
-        throw ex_MANAGE_OFFER_CROSS_SELF{};
-    case MANAGE_OFFER_SELL_NO_ISSUER:
-        throw ex_MANAGE_OFFER_SELL_NO_ISSUER{};
-    case MANAGE_OFFER_BUY_NO_ISSUER:
-        throw ex_MANAGE_OFFER_BUY_NO_ISSUER{};
-    case MANAGE_OFFER_NOT_FOUND:
-        throw ex_MANAGE_OFFER_NOT_FOUND{};
-    case MANAGE_OFFER_LOW_RESERVE:
-        throw ex_MANAGE_OFFER_LOW_RESERVE{};
-    case MANAGE_OFFER_SUCCESS:
+    case PATH_PAYMENT_STRICT_SEND_MALFORMED:
+        throw ex_PATH_PAYMENT_STRICT_SEND_MALFORMED{};
+    case PATH_PAYMENT_STRICT_SEND_UNDERFUNDED:
+        throw ex_PATH_PAYMENT_STRICT_SEND_UNDERFUNDED{};
+    case PATH_PAYMENT_STRICT_SEND_SRC_NO_TRUST:
+        throw ex_PATH_PAYMENT_STRICT_SEND_SRC_NO_TRUST{};
+    case PATH_PAYMENT_STRICT_SEND_SRC_NOT_AUTHORIZED:
+        throw ex_PATH_PAYMENT_STRICT_SEND_SRC_NOT_AUTHORIZED{};
+    case PATH_PAYMENT_STRICT_SEND_NO_DESTINATION:
+        throw ex_PATH_PAYMENT_STRICT_SEND_NO_DESTINATION{};
+    case PATH_PAYMENT_STRICT_SEND_NO_TRUST:
+        throw ex_PATH_PAYMENT_STRICT_SEND_NO_TRUST{};
+    case PATH_PAYMENT_STRICT_SEND_NOT_AUTHORIZED:
+        throw ex_PATH_PAYMENT_STRICT_SEND_NOT_AUTHORIZED{};
+    case PATH_PAYMENT_STRICT_SEND_LINE_FULL:
+        throw ex_PATH_PAYMENT_STRICT_SEND_LINE_FULL{};
+    case PATH_PAYMENT_STRICT_SEND_NO_ISSUER:
+        throw ex_PATH_PAYMENT_STRICT_SEND_NO_ISSUER{};
+    case PATH_PAYMENT_STRICT_SEND_TOO_FEW_OFFERS:
+        throw ex_PATH_PAYMENT_STRICT_SEND_TOO_FEW_OFFERS{};
+    case PATH_PAYMENT_STRICT_SEND_OFFER_CROSS_SELF:
+        throw ex_PATH_PAYMENT_STRICT_SEND_OFFER_CROSS_SELF{};
+    case PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN:
+        throw ex_PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN{};
+    case PATH_PAYMENT_STRICT_SEND_SUCCESS:
+        break;
+    default:
+        throw ex_UNKNOWN{};
+    }
+}
+
+void
+throwIf(ManageSellOfferResult const& result)
+{
+    switch (result.code())
+    {
+    case MANAGE_SELL_OFFER_MALFORMED:
+        throw ex_MANAGE_SELL_OFFER_MALFORMED{};
+    case MANAGE_SELL_OFFER_SELL_NO_TRUST:
+        throw ex_MANAGE_SELL_OFFER_SELL_NO_TRUST{};
+    case MANAGE_SELL_OFFER_BUY_NO_TRUST:
+        throw ex_MANAGE_SELL_OFFER_BUY_NO_TRUST{};
+    case MANAGE_SELL_OFFER_SELL_NOT_AUTHORIZED:
+        throw ex_MANAGE_SELL_OFFER_SELL_NOT_AUTHORIZED{};
+    case MANAGE_SELL_OFFER_BUY_NOT_AUTHORIZED:
+        throw ex_MANAGE_SELL_OFFER_BUY_NOT_AUTHORIZED{};
+    case MANAGE_SELL_OFFER_LINE_FULL:
+        throw ex_MANAGE_SELL_OFFER_LINE_FULL{};
+    case MANAGE_SELL_OFFER_UNDERFUNDED:
+        throw ex_MANAGE_SELL_OFFER_UNDERFUNDED{};
+    case MANAGE_SELL_OFFER_CROSS_SELF:
+        throw ex_MANAGE_SELL_OFFER_CROSS_SELF{};
+    case MANAGE_SELL_OFFER_SELL_NO_ISSUER:
+        throw ex_MANAGE_SELL_OFFER_SELL_NO_ISSUER{};
+    case MANAGE_SELL_OFFER_BUY_NO_ISSUER:
+        throw ex_MANAGE_SELL_OFFER_BUY_NO_ISSUER{};
+    case MANAGE_SELL_OFFER_NOT_FOUND:
+        throw ex_MANAGE_SELL_OFFER_NOT_FOUND{};
+    case MANAGE_SELL_OFFER_LOW_RESERVE:
+        throw ex_MANAGE_SELL_OFFER_LOW_RESERVE{};
+    case MANAGE_SELL_OFFER_SUCCESS:
+        break;
+    default:
+        throw ex_UNKNOWN{};
+    }
+}
+
+void
+throwIf(ManageBuyOfferResult const& result)
+{
+    switch (result.code())
+    {
+    case MANAGE_BUY_OFFER_MALFORMED:
+        throw ex_MANAGE_BUY_OFFER_MALFORMED{};
+    case MANAGE_BUY_OFFER_SELL_NO_TRUST:
+        throw ex_MANAGE_BUY_OFFER_SELL_NO_TRUST{};
+    case MANAGE_BUY_OFFER_BUY_NO_TRUST:
+        throw ex_MANAGE_BUY_OFFER_BUY_NO_TRUST{};
+    case MANAGE_BUY_OFFER_SELL_NOT_AUTHORIZED:
+        throw ex_MANAGE_BUY_OFFER_SELL_NOT_AUTHORIZED{};
+    case MANAGE_BUY_OFFER_BUY_NOT_AUTHORIZED:
+        throw ex_MANAGE_BUY_OFFER_BUY_NOT_AUTHORIZED{};
+    case MANAGE_BUY_OFFER_LINE_FULL:
+        throw ex_MANAGE_BUY_OFFER_LINE_FULL{};
+    case MANAGE_BUY_OFFER_UNDERFUNDED:
+        throw ex_MANAGE_BUY_OFFER_UNDERFUNDED{};
+    case MANAGE_BUY_OFFER_CROSS_SELF:
+        throw ex_MANAGE_BUY_OFFER_CROSS_SELF{};
+    case MANAGE_BUY_OFFER_SELL_NO_ISSUER:
+        throw ex_MANAGE_BUY_OFFER_SELL_NO_ISSUER{};
+    case MANAGE_BUY_OFFER_BUY_NO_ISSUER:
+        throw ex_MANAGE_BUY_OFFER_BUY_NO_ISSUER{};
+    case MANAGE_BUY_OFFER_NOT_FOUND:
+        throw ex_MANAGE_BUY_OFFER_NOT_FOUND{};
+    case MANAGE_BUY_OFFER_LOW_RESERVE:
+        throw ex_MANAGE_BUY_OFFER_LOW_RESERVE{};
+    case MANAGE_BUY_OFFER_SUCCESS:
         break;
     default:
         throw ex_UNKNOWN{};
@@ -326,14 +398,14 @@ throwIf(TransactionResult const& result)
     case PAYMENT:
         throwIf(opResult.tr().paymentResult());
         break;
-    case PATH_PAYMENT:
-        throwIf(opResult.tr().pathPaymentResult());
+    case PATH_PAYMENT_STRICT_RECEIVE:
+        throwIf(opResult.tr().pathPaymentStrictReceiveResult());
         break;
-    case MANAGE_OFFER:
-        throwIf(opResult.tr().manageOfferResult());
+    case MANAGE_SELL_OFFER:
+        throwIf(opResult.tr().manageSellOfferResult());
         break;
-    case CREATE_PASSIVE_OFFER:
-        throwIf(opResult.tr().createPassiveOfferResult());
+    case CREATE_PASSIVE_SELL_OFFER:
+        throwIf(opResult.tr().createPassiveSellOfferResult());
         break;
     case SET_OPTIONS:
         throwIf(opResult.tr().setOptionsResult());
@@ -355,6 +427,12 @@ throwIf(TransactionResult const& result)
         break;
     case BUMP_SEQUENCE:
         throwIf(opResult.tr().bumpSeqResult());
+        break;
+    case MANAGE_BUY_OFFER:
+        throwIf(opResult.tr().manageBuyOfferResult());
+        break;
+    case PATH_PAYMENT_STRICT_SEND:
+        throwIf(opResult.tr().pathPaymentStrictSendResult());
         break;
     }
 }

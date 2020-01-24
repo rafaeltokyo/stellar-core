@@ -9,7 +9,6 @@
 #include "xdr/Stellar-types.h"
 
 #include <cereal/cereal.hpp>
-#include <lib/json/json.h>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -17,11 +16,11 @@
 namespace asio
 {
 typedef std::error_code error_code;
-};
+}
 
-namespace Json
+namespace medida
 {
-class Value;
+class Meter;
 }
 
 namespace stellar
@@ -81,7 +80,7 @@ struct HistoryArchiveState
                                  std::string const& archiveName);
 
     // Return cumulative hash of the bucketlist for this archive state.
-    Hash getBucketListHash();
+    Hash getBucketListHash() const;
 
     // Return vector of buckets to fetch/apply to turn 'other' into 'this'.
     // Vector is sorted from largest/highest-numbered bucket to smallest/lowest,
@@ -109,10 +108,8 @@ struct HistoryArchiveState
            CEREAL_NVP(currentBuckets));
     }
 
-    // Return true if all the 'next' bucket-futures that can be resolved are
-    // ready to be (instantaneously) resolved, or false if a merge is still
-    // in progress on one or more of them.
-    bool futuresAllReady() const;
+    // Return true if all futures are in FB_CLEAR state
+    bool futuresAllClear() const;
 
     // Return true if all futures have already been resolved, otherwise false.
     bool futuresAllResolved() const;
@@ -132,12 +129,16 @@ struct HistoryArchiveState
 
     std::string toString() const;
     void fromString(std::string const& str);
+
+    void prepareForPublish(Application& app);
+    bool containsValidBuckets(Application& app) const;
 };
 
 class HistoryArchive : public std::enable_shared_from_this<HistoryArchive>
 {
   public:
-    explicit HistoryArchive(HistoryArchiveConfiguration const& config);
+    explicit HistoryArchive(Application& app,
+                            HistoryArchiveConfiguration const& config);
     ~HistoryArchive();
     bool hasGetCmd() const;
     bool hasPutCmd() const;
@@ -153,11 +154,12 @@ class HistoryArchive : public std::enable_shared_from_this<HistoryArchive>
     void markSuccess();
     void markFailure();
 
-    Json::Value getJsonInfo() const;
+    uint64_t getSuccessCount() const;
+    uint64_t getFailureCount() const;
 
   private:
     HistoryArchiveConfiguration mConfig;
-    uint32_t mSuccess{0};
-    uint32_t mFailure{0};
+    medida::Meter& mSuccessMeter;
+    medida::Meter& mFailureMeter;
 };
 }

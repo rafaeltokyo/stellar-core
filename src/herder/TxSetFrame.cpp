@@ -5,15 +5,23 @@
 #include "util/asio.h"
 #include "TxSetFrame.h"
 #include "crypto/Hex.h"
+#include "crypto/Random.h"
 #include "crypto/SHA.h"
 #include "database/Database.h"
 #include "ledger/LedgerManager.h"
+#include "ledger/LedgerTxn.h"
+#include "ledger/LedgerTxnEntry.h"
+#include "ledger/LedgerTxnHeader.h"
 #include "main/Application.h"
 #include "main/Config.h"
+#include "transactions/TransactionUtils.h"
+#include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/XDROperators.h"
 #include "xdrpp/marshal.h"
 #include <algorithm>
+#include <list>
+#include <numeric>
 
 #include "xdrpp/printer.h"
 
@@ -92,38 +100,44 @@ SeqSorter(TransactionFramePtr const& tx1, TransactionFramePtr const& tx2)
 std::vector<TransactionFramePtr>
 TxSetFrame::sortForApply()
 {
-    vector<TransactionFramePtr> retList;
+    auto txQueues = buildAccountTxQueues();
 
-    vector<vector<TransactionFramePtr>> txBatches(4);
-    map<AccountID, size_t> accountTxCountMap;
-    retList = mTransactions;
-    // sort all the txs by seqnum
-    std::sort(retList.begin(), retList.end(), SeqSorter);
+    // build txBatches
+    // txBatches i-th element contains each i-th transaction for accounts with a
+    // transaction in the transaction set
+    std::list<std::deque<TransactionFramePtr>> txBatches;
 
-    // build the txBatches
-    // batch[i] contains the i-th transaction for any account with
-    // a transaction in the transaction set
-    for (auto tx : retList)
+    while (!txQueues.empty())
     {
-        auto& v = accountTxCountMap[tx->getSourceID()];
-
-        if (v >= txBatches.size())
+        txBatches.emplace_back();
+        auto& curBatch = txBatches.back();
+        // go over all users that still have transactions
+        for (auto it = txQueues.begin(); it != txQueues.end();)
         {
-            txBatches.resize(v + 4);
+            auto& h = it->second.front();
+            curBatch.emplace_back(h);
+            it->second.pop_front();
+            if (it->second.empty())
+            {
+                // done with that user
+                it = txQueues.erase(it);
+            }
+            else
+            {
+                it++;
+            }
         }
-        txBatches[v].push_back(tx);
-        v++;
     }
 
-    retList.clear();
-
+    vector<TransactionFramePtr> retList;
+    retList.reserve(mTransactions.size());
     for (auto& batch : txBatches)
     {
         // randomize each batch using the hash of the transaction set
         // as a way to randomize even more
         ApplyTxSorter s(getContentsHash());
         std::sort(batch.begin(), batch.end(), s);
-        for (auto tx : batch)
+        for (auto const& tx : batch)
         {
             retList.push_back(tx);
         }
@@ -132,56 +146,136 @@ TxSetFrame::sortForApply()
     return retList;
 }
 
-struct SurgeSorter
+struct SurgeCompare
 {
-    map<AccountID, double>& mAccountFeeMap;
-    SurgeSorter(map<AccountID, double>& afm) : mAccountFeeMap(afm)
+    Hash mSeed;
+    LedgerHeader const& mHeader;
+    SurgeCompare(LedgerHeader const& header)
+        : mSeed(HashUtils::random()), mHeader(header)
     {
     }
 
+    // return true if tx1 < tx2
     bool
-    operator()(TransactionFramePtr const& tx1, TransactionFramePtr const& tx2)
+    operator()(TxSetFrame::AccountTransactionQueue const* tx1,
+               TxSetFrame::AccountTransactionQueue const* tx2) const
     {
-        if (tx1->getSourceID() == tx2->getSourceID())
-            return tx1->getSeqNum() < tx2->getSeqNum();
-        double fee1 = mAccountFeeMap[tx1->getSourceID()];
-        double fee2 = mAccountFeeMap[tx2->getSourceID()];
-        if (fee1 == fee2)
-            return tx1->getSourceID() < tx2->getSourceID();
-        return fee1 > fee2;
+        if (tx1 == nullptr || tx1->empty())
+        {
+            return tx2 ? !tx2->empty() : false;
+        }
+        if (tx2 == nullptr || tx2->empty())
+        {
+            return false;
+        }
+
+        auto& top1 = tx1->front();
+        auto& top2 = tx2->front();
+
+        // compare fee/minFee between top1 and top2
+        auto v1 = bigMultiply(top1->getFeeBid(), top2->getMinFee(mHeader));
+        auto v2 = bigMultiply(top2->getFeeBid(), top1->getMinFee(mHeader));
+        if (v1 < v2)
+        {
+            return true;
+        }
+        else if (v1 > v2)
+        {
+            return false;
+        }
+        // use hash of transaction as a tie breaker
+        return lessThanXored(top1->getFullHash(), top2->getFullHash(), mSeed);
     }
 };
 
-void
-TxSetFrame::surgePricingFilter(LedgerManager const& lm)
+std::unordered_map<AccountID, TxSetFrame::AccountTransactionQueue>
+TxSetFrame::buildAccountTxQueues()
 {
-    size_t max = lm.getMaxTxSetSize();
-    if (mTransactions.size() > max)
-    { // surge pricing in effect!
+    std::unordered_map<AccountID, AccountTransactionQueue> actTxQueueMap;
+    for (auto& tx : mTransactions)
+    {
+        auto& id = tx->getSourceID();
+        auto it = actTxQueueMap.find(id);
+        if (it == actTxQueueMap.end())
+        {
+            auto d = std::make_pair(id, AccountTransactionQueue{});
+            auto r = actTxQueueMap.insert(d);
+            it = r.first;
+        }
+        it->second.emplace_back(tx);
+    }
+
+    for (auto& am : actTxQueueMap)
+    {
+        // sort each in sequence number order
+        std::sort(am.second.begin(), am.second.end(), SeqSorter);
+    }
+    return actTxQueueMap;
+}
+
+void
+TxSetFrame::surgePricingFilter(Application& app)
+{
+    LedgerTxn ltx(app.getLedgerTxnRoot());
+    auto header = ltx.loadHeader();
+
+    bool maxIsOps = header.current().ledgerVersion >= 11;
+
+    size_t opsLeft;
+    {
+        size_t maxTxSetSize = header.current().maxTxSetSize;
+        opsLeft = maxIsOps ? maxTxSetSize : (maxTxSetSize * MAX_OPS_PER_TX);
+    }
+
+    auto curSizeOps = maxIsOps ? sizeOp() : (sizeTx() * MAX_OPS_PER_TX);
+    if (curSizeOps > opsLeft)
+    {
         CLOG(WARNING, "Herder")
-            << "surge pricing in effect! " << mTransactions.size();
+            << "surge pricing in effect! " << curSizeOps << " > " << opsLeft;
 
-        // determine the fee ratio for each account
-        map<AccountID, double> accountFeeMap;
-        for (auto& tx : mTransactions)
+        auto actTxQueueMap = buildAccountTxQueues();
+
+        auto headerCopy = header.current();
+        SurgeCompare const surge(headerCopy);
+        std::priority_queue<AccountTransactionQueue*,
+                            std::vector<AccountTransactionQueue*>, SurgeCompare>
+            surgeQueue(surge);
+
+        for (auto& am : actTxQueueMap)
         {
-            double r = tx->getFeeRatio(lm);
-            double now = accountFeeMap[tx->getSourceID()];
-            if (now == 0)
-                accountFeeMap[tx->getSourceID()] = r;
-            else if (r < now)
-                accountFeeMap[tx->getSourceID()] = r;
+            surgeQueue.push(&am.second);
         }
 
-        // sort tx by amount of fee they have paid
-        // remove the bottom that aren't paying enough
-        std::vector<TransactionFramePtr> tempList = mTransactions;
-        std::sort(tempList.begin(), tempList.end(), SurgeSorter(accountFeeMap));
-
-        for (auto iter = tempList.begin() + max; iter != tempList.end(); iter++)
+        std::vector<TransactionFramePtr> updatedSet;
+        updatedSet.reserve(mTransactions.size());
+        while (opsLeft > 0 && !surgeQueue.empty())
         {
-            removeTx(*iter);
+            auto cur = surgeQueue.top();
+            surgeQueue.pop();
+            // inspect the top candidate queue
+            auto& curTopTx = cur->front();
+            size_t opsCount =
+                maxIsOps ? curTopTx->getOperations().size() : MAX_OPS_PER_TX;
+            if (opsCount <= opsLeft)
+            {
+                // pop from this one
+                updatedSet.emplace_back(curTopTx);
+                cur->pop_front();
+                opsLeft -= opsCount;
+                // if there are more transactions, put it back
+                if (!cur->empty())
+                {
+                    surgeQueue.push(cur);
+                }
+            }
+            else
+            {
+                // drop this transaction -> we need to drop the others
+                cur->clear();
+            }
         }
+        mTransactions = std::move(updatedSet);
+        sortForHash();
     }
 }
 
@@ -190,10 +284,12 @@ TxSetFrame::checkOrTrim(
     Application& app,
     std::function<bool(TransactionFramePtr, SequenceNumber)>
         processInvalidTxLambda,
-    std::function<bool(std::vector<TransactionFramePtr> const&)>
+    std::function<bool(std::deque<TransactionFramePtr> const&)>
         processInsufficientBalance)
 {
-    map<AccountID, vector<TransactionFramePtr>> accountTxMap;
+    LedgerTxn ltx(app.getLedgerTxnRoot());
+
+    auto accountTxMap = buildAccountTxQueues();
 
     Hash lastHash;
     for (auto& tx : mTransactions)
@@ -205,28 +301,24 @@ TxSetFrame::checkOrTrim(
                 << " not sorted correctly";
             return false;
         }
-        accountTxMap[tx->getSourceID()].push_back(tx);
         lastHash = tx->getFullHash();
     }
 
     for (auto& item : accountTxMap)
     {
-        // order by sequence number
-        std::sort(item.second.begin(), item.second.end(), SeqSorter);
-
         TransactionFramePtr lastTx;
         SequenceNumber lastSeq = 0;
         int64_t totFee = 0;
         for (auto& tx : item.second)
         {
-            if (!tx->checkValid(app, lastSeq))
+            if (!tx->checkValid(ltx, lastSeq))
             {
                 if (processInvalidTxLambda(tx, lastSeq))
                     continue;
 
                 return false;
             }
-            totFee += tx->getFee();
+            totFee += tx->getFeeBid();
 
             lastTx = tx;
             lastSeq = tx->getSeqNum();
@@ -234,8 +326,9 @@ TxSetFrame::checkOrTrim(
         if (lastTx)
         {
             // make sure account can pay the fee for all these tx
-            auto const& source = lastTx->getSourceAccount();
-            if (source.getAvailableBalance(app.getLedgerManager()) < totFee)
+            auto const& source =
+                stellar::loadAccount(ltx, lastTx->getSourceID());
+            if (getAvailableBalance(ltx.loadHeader(), source) < totFee)
             {
                 if (!processInsufficientBalance(item.second))
                     return false;
@@ -246,14 +339,10 @@ TxSetFrame::checkOrTrim(
     return true;
 }
 
-void
-TxSetFrame::trimInvalid(Application& app,
-                        std::vector<TransactionFramePtr>& trimmed)
+std::vector<TransactionFramePtr>
+TxSetFrame::trimInvalid(Application& app)
 {
-    // Establish read-only transaction for duration of trimInvalid
-    soci::transaction sqltx(app.getDatabase().getSession());
-    app.getDatabase().setCurrentTransactionReadOnly();
-
+    std::vector<TransactionFramePtr> trimmed;
     sortForHash();
 
     auto processInvalidTxLambda = [&](TransactionFramePtr tx,
@@ -263,7 +352,7 @@ TxSetFrame::trimInvalid(Application& app,
         return true;
     };
     auto processInsufficientBalance =
-        [&](vector<TransactionFramePtr> const& item) {
+        [&](deque<TransactionFramePtr> const& item) {
             for (auto& tx : item)
             {
                 trimmed.push_back(tx);
@@ -273,6 +362,7 @@ TxSetFrame::trimInvalid(Application& app,
         };
 
     checkOrTrim(app, processInvalidTxLambda, processInsufficientBalance);
+    return trimmed;
 }
 
 // need to make sure every account that is submitting a tx has enough to pay
@@ -281,26 +371,20 @@ TxSetFrame::trimInvalid(Application& app,
 bool
 TxSetFrame::checkValid(Application& app)
 {
-    // Establish read-only transaction for duration of checkValid
-    soci::transaction sqltx(app.getDatabase().getSession());
-    app.getDatabase().setCurrentTransactionReadOnly();
-
     auto& lcl = app.getLedgerManager().getLastClosedLedgerHeader();
     // Start by checking previousLedgerHash
     if (lcl.hash != mPreviousLedgerHash)
     {
         CLOG(DEBUG, "Herder")
             << "Got bad txSet: " << hexAbbrev(mPreviousLedgerHash)
-            << " ; expected: "
-            << hexAbbrev(
-                   app.getLedgerManager().getLastClosedLedgerHeader().hash);
+            << " ; expected: " << hexAbbrev(lcl.hash);
         return false;
     }
 
-    if (mTransactions.size() > lcl.header.maxTxSetSize)
+    if (this->size(lcl.header) > lcl.header.maxTxSetSize)
     {
         CLOG(DEBUG, "Herder")
-            << "Got bad txSet: too many txs " << mTransactions.size() << " > "
+            << "Got bad txSet: too many txs " << this->size(lcl.header) << " > "
             << lcl.header.maxTxSetSize;
         return false;
     }
@@ -316,7 +400,7 @@ TxSetFrame::checkValid(Application& app)
         return false;
     };
     auto processInsufficientBalance =
-        [&](vector<TransactionFramePtr> const& item) {
+        [&](deque<TransactionFramePtr> const& item) {
             CLOG(DEBUG, "Herder")
                 << "bad txSet: " << hexAbbrev(mPreviousLedgerHash)
                 << " account can't pay fee"
@@ -336,7 +420,7 @@ TxSetFrame::removeTx(TransactionFramePtr tx)
     mHashIsValid = false;
 }
 
-Hash
+Hash const&
 TxSetFrame::getContentsHash()
 {
     if (!mHashIsValid)
@@ -367,9 +451,70 @@ TxSetFrame::previousLedgerHash() const
     return mPreviousLedgerHash;
 }
 
+size_t
+TxSetFrame::size(LedgerHeader const& lh) const
+{
+    return lh.ledgerVersion >= 11 ? sizeOp() : sizeTx();
+}
+
+size_t
+TxSetFrame::sizeOp() const
+{
+    return std::accumulate(
+        mTransactions.begin(), mTransactions.end(), size_t(0),
+        [](size_t a, TransactionFramePtr const& tx) {
+            return a + tx->getEnvelope().tx.operations.size();
+        });
+}
+
+int64_t
+TxSetFrame::getBaseFee(LedgerHeader const& lh) const
+{
+    int64_t baseFee = lh.baseFee;
+    if (lh.ledgerVersion >= 11)
+    {
+        size_t ops = 0;
+        int64_t lowBaseFee = std::numeric_limits<int64_t>::max();
+        for (auto& txPtr : mTransactions)
+        {
+            auto txOps = txPtr->getEnvelope().tx.operations.size();
+            ops += txOps;
+            int64_t txBaseFee =
+                bigDivide(txPtr->getFeeBid(), 1, static_cast<int64_t>(txOps),
+                          Rounding::ROUND_UP);
+            lowBaseFee = std::min(lowBaseFee, txBaseFee);
+        }
+        // if surge pricing was in action, use the lowest base fee bid from the
+        // transaction set
+        size_t surgeOpsCutoff = 0;
+        if (lh.maxTxSetSize >= MAX_OPS_PER_TX)
+        {
+            surgeOpsCutoff = lh.maxTxSetSize - MAX_OPS_PER_TX;
+        }
+        if (ops > surgeOpsCutoff)
+        {
+            baseFee = lowBaseFee;
+        }
+    }
+    return baseFee;
+}
+
+int64_t
+TxSetFrame::getTotalFees(LedgerHeader const& lh) const
+{
+    auto baseFee = getBaseFee(lh);
+    return std::accumulate(mTransactions.begin(), mTransactions.end(),
+                           int64_t(0),
+                           [&](int64_t t, TransactionFramePtr const& tx) {
+                               return t + tx->getFee(lh, baseFee);
+                           });
+}
+
 void
 TxSetFrame::toXDR(TransactionSet& txSet)
 {
+    releaseAssert(std::is_sorted(mTransactions.begin(), mTransactions.end(),
+                                 HashTxSorter));
     txSet.txs.resize(xdr::size32(mTransactions.size()));
     for (unsigned int n = 0; n < mTransactions.size(); n++)
     {

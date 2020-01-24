@@ -7,8 +7,11 @@
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "main/Application.h"
+#include "main/ErrorMessages.h"
 #include "util/Fs.h"
 #include "util/Logging.h"
+#include "util/format.h"
+
 #include <medida/meter.h>
 #include <medida/metrics_registry.h>
 
@@ -18,93 +21,111 @@ namespace stellar
 {
 
 VerifyBucketWork::VerifyBucketWork(
-    Application& app, WorkParent& parent,
-    std::map<std::string, std::shared_ptr<Bucket>>& buckets,
+    Application& app, std::map<std::string, std::shared_ptr<Bucket>>& buckets,
     std::string const& bucketFile, uint256 const& hash)
-    : Work(app, parent, std::string("verify-bucket-hash ") + bucketFile,
-           RETRY_NEVER)
+    : BasicWork(app, "verify-bucket-hash-" + bucketFile, BasicWork::RETRY_NEVER)
     , mBuckets(buckets)
     , mBucketFile(bucketFile)
     , mHash(hash)
-    , mVerifyBucketSuccess{app.getMetrics().NewMeter(
-          {"history", "verify-bucket", "success"}, "event")}
-    , mVerifyBucketFailure{app.getMetrics().NewMeter(
-          {"history", "verify-bucket", "failure"}, "event")}
+    , mVerifyBucketSuccess(app.getMetrics().NewMeter(
+          {"history", "verify-bucket", "success"}, "event"))
+    , mVerifyBucketFailure(app.getMetrics().NewMeter(
+          {"history", "verify-bucket", "failure"}, "event"))
 {
-    fs::checkNoGzipSuffix(mBucketFile);
 }
 
-VerifyBucketWork::~VerifyBucketWork()
+BasicWork::State
+VerifyBucketWork::onRun()
 {
-    clearChildren();
+    if (mDone)
+    {
+        if (mEc)
+        {
+            mVerifyBucketFailure.Mark();
+            return State::WORK_FAILURE;
+        }
+
+        adoptBucket();
+        mVerifyBucketSuccess.Mark();
+        return State::WORK_SUCCESS;
+    }
+
+    spawnVerifier();
+    return State::WORK_WAITING;
 }
 
 void
-VerifyBucketWork::onStart()
+VerifyBucketWork::adoptBucket()
+{
+    assert(mDone);
+    assert(!mEc);
+
+    auto b = mApp.getBucketManager().adoptFileAsBucket(mBucketFile, mHash,
+                                                       /*objectsPut=*/0,
+                                                       /*bytesPut=*/0);
+    mBuckets[binToHex(mHash)] = b;
+}
+
+void
+VerifyBucketWork::spawnVerifier()
 {
     std::string filename = mBucketFile;
     uint256 hash = mHash;
     Application& app = this->mApp;
-    auto handler = callComplete();
-    app.getWorkerIOService().post([&app, filename, handler, hash]() {
-        auto hasher = SHA256::create();
-        asio::error_code ec;
-        char buf[4096];
-        {
-            // ensure that the stream gets its own scope to avoid race with
-            // main thread
-            std::ifstream in(filename, std::ifstream::binary);
-            while (in)
+    std::weak_ptr<VerifyBucketWork> weak(
+        std::static_pointer_cast<VerifyBucketWork>(shared_from_this()));
+    app.postOnBackgroundThread(
+        [&app, filename, weak, hash]() {
+            auto hasher = SHA256::create();
+            asio::error_code ec;
             {
-                in.read(buf, sizeof(buf));
-                hasher->add(ByteSlice(buf, in.gcount()));
+                CLOG(INFO, "History")
+                    << fmt::format("Verifying bucket {}", binToHex(hash));
+
+                // ensure that the stream gets its own scope to avoid race with
+                // main thread
+                std::ifstream in(filename, std::ifstream::binary);
+                char buf[4096];
+                while (in)
+                {
+                    in.read(buf, sizeof(buf));
+                    hasher->add(ByteSlice(buf, in.gcount()));
+                }
+                uint256 vHash = hasher->finish();
+                if (vHash == hash)
+                {
+                    CLOG(DEBUG, "History")
+                        << "Verified hash (" << hexAbbrev(hash) << ") for "
+                        << filename;
+                }
+                else
+                {
+                    CLOG(WARNING, "History")
+                        << "FAILED verifying hash for " << filename;
+                    CLOG(WARNING, "History")
+                        << "expected hash: " << binToHex(hash);
+                    CLOG(WARNING, "History")
+                        << "computed hash: " << binToHex(vHash);
+                    CLOG(WARNING, "History") << POSSIBLY_CORRUPTED_HISTORY;
+                    ec = std::make_error_code(std::errc::io_error);
+                }
             }
-            uint256 vHash = hasher->finish();
-            if (vHash == hash)
-            {
-                CLOG(DEBUG, "History") << "Verified hash (" << hexAbbrev(hash)
-                                       << ") for " << filename;
-            }
-            else
-            {
-                CLOG(WARNING, "History")
-                    << "FAILED verifying hash for " << filename;
-                CLOG(WARNING, "History") << "expected hash: " << binToHex(hash);
-                CLOG(WARNING, "History")
-                    << "computed hash: " << binToHex(vHash);
-                ec = std::make_error_code(std::errc::io_error);
-            }
-        }
-        app.getClock().getIOService().post([ec, handler]() { handler(ec); });
-    });
-}
 
-void
-VerifyBucketWork::onRun()
-{
-    // Do nothing: we spawned the verifier in onStart().
-}
-
-Work::State
-VerifyBucketWork::onSuccess()
-{
-    auto b = mApp.getBucketManager().adoptFileAsBucket(mBucketFile, mHash);
-    mBuckets[binToHex(mHash)] = b;
-    mVerifyBucketSuccess.Mark();
-    return WORK_SUCCESS;
-}
-
-void
-VerifyBucketWork::onFailureRetry()
-{
-    mVerifyBucketFailure.Mark();
-    Work::onFailureRetry();
-}
-
-void
-VerifyBucketWork::onFailureRaise()
-{
-    mVerifyBucketFailure.Mark();
-    Work::onFailureRaise();
+            // Not ideal, but needed to prevent race conditions with
+            // main thread, since BasicWork's state is not thread-safe. This is
+            // a temporary workaround, as a cleaner solution is needed.
+            app.postOnMainThread(
+                [weak, ec]() {
+                    auto self = weak.lock();
+                    if (self)
+                    {
+                        self->mEc = ec;
+                        self->mDone = true;
+                        self->wakeUp();
+                    }
+                },
+                "VerifyBucket: finish");
+        },
+        "VerifyBucket: start in background");
 }
 }

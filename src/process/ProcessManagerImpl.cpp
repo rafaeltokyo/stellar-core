@@ -14,11 +14,10 @@
 #include "process/PosixSpawnFileActions.h"
 #include "process/ProcessManager.h"
 #include "process/ProcessManagerImpl.h"
+#include "util/Fs.h"
 #include "util/Logging.h"
 #include "util/Timer.h"
-
-#include "medida/counter.h"
-#include "medida/metrics_registry.h"
+#include "util/format.h"
 
 #include <algorithm>
 #include <functional>
@@ -27,12 +26,16 @@
 #include <regex>
 #include <string>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <Windows.h>
+
+#include "util/FileSystemException.h"
+#else
 #include <errno.h>
 #include <fcntl.h>
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
 extern char** environ;
 #endif
 
@@ -56,8 +59,9 @@ class ProcessExitEvent::Impl
   public:
     std::shared_ptr<RealTimer> mOuterTimer;
     std::shared_ptr<asio::error_code> mOuterEc;
-    std::string mCmdLine;
-    std::string mOutFile;
+    std::string const mCmdLine;
+    std::string const mOutFile;
+    std::string const mTempFile;
     bool mRunning{false};
 #ifdef _WIN32
     asio::windows::object_handle mProcessHandle;
@@ -68,17 +72,42 @@ class ProcessExitEvent::Impl
     Impl(std::shared_ptr<RealTimer> const& outerTimer,
          std::shared_ptr<asio::error_code> const& outerEc,
          std::string const& cmdLine, std::string const& outFile,
-         std::weak_ptr<ProcessManagerImpl> pm)
+         std::string const& tempFile, std::weak_ptr<ProcessManagerImpl> pm)
         : mOuterTimer(outerTimer)
         , mOuterEc(outerEc)
         , mCmdLine(cmdLine)
         , mOutFile(outFile)
+        , mTempFile(tempFile)
 #ifdef _WIN32
-        , mProcessHandle(outerTimer->get_io_service())
+        , mProcessHandle(outerTimer->get_executor())
 #endif
         , mProcManagerImpl(pm)
     {
     }
+
+    bool
+    finish()
+    {
+        if (!mOutFile.empty())
+        {
+            if (fs::exists(mOutFile))
+            {
+                CLOG(WARNING, "Process")
+                    << "Outfile already exists: " << mOutFile;
+                return false;
+            }
+            else if (mRunning &&
+                     std::rename(mTempFile.c_str(), mOutFile.c_str()))
+            {
+                CLOG(ERROR, "Process")
+                    << fmt::format("{} -> {} rename failed, error: {}",
+                                   mTempFile, mOutFile, errno);
+                return false;
+            }
+        }
+        return true;
+    }
+
     void run();
     void
     cancel(asio::error_code const& ec)
@@ -102,19 +131,19 @@ ProcessManagerImpl::getNumRunningProcesses()
 
 ProcessManagerImpl::~ProcessManagerImpl()
 {
-    const auto killProcess = [&](ProcessExitEvent::Impl& impl) {
-        impl.cancel(ABORT_ERROR_CODE);
-        forceShutdown(impl);
+    const auto killProcess = [&](ProcessExitEvent& pe) {
+        pe.mImpl->cancel(ABORT_ERROR_CODE);
+        forceShutdown(pe);
     };
     // Use SIGKILL on any processes we already used SIGINT on
-    while (!mKillableImpls.empty())
+    while (!mKillable.empty())
     {
-        auto impl = std::move(mKillableImpls.front());
-        mKillableImpls.pop_front();
+        auto impl = std::move(mKillable.front());
+        mKillable.pop_front();
         killProcess(*impl);
     }
     // Use SIGKILL on any processes we haven't politely asked to exit yet
-    for (auto& pair : mImpls)
+    for (auto& pair : mProcesses)
     {
         killProcess(*pair.second);
     }
@@ -135,28 +164,89 @@ ProcessManagerImpl::shutdown()
         auto ec = ABORT_ERROR_CODE;
 
         // Cancel all pending.
-        std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
-        for (auto& pending : mPendingImpls)
+        std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+        for (auto& pending : mPending)
         {
-            pending->cancel(ec);
+            pending->mImpl->cancel(ec);
         }
-        mPendingImpls.clear();
+        mPending.clear();
 
         // Cancel all running.
-        for (auto& pair : mImpls)
+        for (auto& pair : mProcesses)
         {
             // Mark it as "ready to be killed"
-            mKillableImpls.push_back(pair.second);
+            mKillable.push_back(pair.second);
             // Cancel any pending events and shut down the process cleanly
-            pair.second->cancel(ec);
+            pair.second->mImpl->cancel(ec);
             cleanShutdown(*pair.second);
         }
-        mImpls.clear();
+        mProcesses.clear();
         gNumProcessesActive = 0;
 #ifndef _WIN32
         mSigChild.cancel(ec);
 #endif
     }
+}
+
+bool
+ProcessManagerImpl::tryProcessShutdown(std::shared_ptr<ProcessExitEvent> pe)
+{
+    if (!pe)
+    {
+        CLOG(ERROR, "Process")
+            << "Process shutdown: must provide valid ProcessExitEvent pointer";
+        throw std::runtime_error("Invalid ProcessExitEvent");
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+    auto ec = ABORT_ERROR_CODE;
+    auto impl = pe->mImpl;
+
+    // If we already tried nice kill, force shutdown and return success.
+    auto killableIt = find(mKillable.begin(), mKillable.end(), pe);
+    if (killableIt != mKillable.end())
+    {
+        CLOG(DEBUG, "Process") << "Shutting down (forced): " << impl->mCmdLine;
+        forceShutdown(*pe);
+        return true;
+    }
+
+    // Otherwise, there are three possible scenarios for process shutdown:
+    // 1. Process is in pending queue, and hasn't run yet
+    // 2. Process is currently running, in which case we try to kill it nicely
+    // 3. Process didn't get killed correctly, so we issue a force kill
+
+    CLOG(DEBUG, "Process") << "Shutting down (nicely): " << impl->mCmdLine;
+    auto pendingIt = find(mPending.begin(), mPending.end(), pe);
+    if (pendingIt != mPending.end())
+    {
+        (*pendingIt)->mImpl->cancel(ec);
+        mPending.erase(pendingIt);
+    }
+    else
+    {
+        // Process is running, so issue a `kill` command
+        // and remove from the list of running processes
+        auto pid = impl->getProcessId();
+        auto runningIt = mProcesses.find(pid);
+        if (runningIt != mProcesses.end())
+        {
+            // Mark it as "ready to be killed"
+            mKillable.push_back(runningIt->second);
+            impl->cancel(ec);
+            auto res = cleanShutdown(*runningIt->second);
+            mProcesses.erase(pid);
+            gNumProcessesActive--;
+            return res;
+        }
+        else
+        {
+            CLOG(DEBUG, "Process")
+                << "failed to find pending or running process";
+            return false;
+        }
+    }
+    return true;
 }
 
 #ifdef _WIN32
@@ -165,8 +255,10 @@ ProcessManagerImpl::shutdown()
 
 ProcessManagerImpl::ProcessManagerImpl(Application& app)
     : mMaxProcesses(app.getConfig().MAX_CONCURRENT_SUBPROCESSES)
-    , mIOService(app.getClock().getIOService())
-    , mSigChild(mIOService)
+    , mIOContext(app.getClock().getIOContext())
+    , mSigChild(mIOContext)
+    , mTmpDir(
+          std::make_unique<TmpDir>(app.getTmpDirManager().tmpDir("process")))
 {
 }
 
@@ -181,6 +273,60 @@ ProcessManagerImpl::handleSignalWait()
 {
     // No-op on windows, uses waitable object handles
 }
+namespace
+{
+struct InfoHelper
+{
+    STARTUPINFOEX mStartupInfo;
+    std::vector<uint8_t> mBuffer;
+    std::vector<HANDLE> mHandles;
+    bool mInitialized{false};
+    InfoHelper()
+    {
+        ZeroMemory(&mStartupInfo, sizeof(mStartupInfo));
+        mStartupInfo.StartupInfo.cb = sizeof(mStartupInfo);
+    }
+    void
+    prepare()
+    {
+        if (mInitialized)
+        {
+            throw std::runtime_error(
+                "InfoHelper::prepare: already initialized");
+        }
+        SIZE_T atSize;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &atSize);
+        mBuffer.resize(atSize);
+        mStartupInfo.lpAttributeList =
+            reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(mBuffer.data());
+
+        if (!InitializeProcThreadAttributeList(mStartupInfo.lpAttributeList, 1,
+                                               0, &atSize))
+        {
+            CLOG(ERROR, "Process")
+                << "InfoHelper::prepare() failed: " << GetLastError();
+            throw std::runtime_error("InfoHelper::prepare() failed");
+        }
+        mInitialized = true;
+        if (!UpdateProcThreadAttribute(
+                mStartupInfo.lpAttributeList, 0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, mHandles.data(),
+                mHandles.size() * sizeof(HANDLE), NULL, NULL))
+        {
+            CLOG(ERROR, "Process")
+                << "InfoHelper::prepare() failed: " << GetLastError();
+            throw std::runtime_error("InfoHelper::prepare() failed");
+        }
+    }
+    ~InfoHelper()
+    {
+        if (mInitialized)
+        {
+            DeleteProcThreadAttributeList(mStartupInfo.lpAttributeList);
+        }
+    }
+};
+}
 
 void
 ProcessExitEvent::Impl::run()
@@ -193,12 +339,13 @@ ProcessExitEvent::Impl::run()
         throw std::runtime_error("ProcessExitEvent::Impl already running");
     }
 
-    STARTUPINFO si;
     PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
+
     LPSTR cmd = (LPSTR)mCmdLine.data();
+
+    InfoHelper iH;
+    auto& si = iH.mStartupInfo.StartupInfo;
 
     if (!mOutFile.empty())
     {
@@ -207,10 +354,9 @@ ProcessExitEvent::Impl::run()
         sa.lpSecurityDescriptor = NULL;
         sa.bInheritHandle = TRUE;
 
-        si.cb = sizeof(STARTUPINFO);
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput =
-            CreateFile((LPCTSTR)mOutFile.c_str(),          // name of the file
+            CreateFile((LPCTSTR)mTempFile.c_str(),         // name of the file
                        GENERIC_WRITE,                      // open for writing
                        FILE_SHARE_WRITE | FILE_SHARE_READ, // share r/w access
                        &sa,                   // security attributes
@@ -222,25 +368,48 @@ ProcessExitEvent::Impl::run()
             CLOG(ERROR, "Process") << "CreateFile() failed: " << GetLastError();
             throw std::runtime_error("CreateFile() failed");
         }
+        iH.mHandles.push_back(si.hStdOutput);
     }
+    else
+    {
+        auto out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (out != INVALID_HANDLE_VALUE)
+        {
+            iH.mHandles.push_back(out);
+        }
+    }
+
+    // also inherit stderr if we can
+    auto err = GetStdHandle(STD_ERROR_HANDLE);
+    if (err != INVALID_HANDLE_VALUE)
+    {
+        si.hStdError = err;
+        iH.mHandles.push_back(err);
+    }
+
+    iH.prepare();
 
     if (!CreateProcess(NULL,    // No module name (use command line)
                        cmd,     // Command line
                        nullptr, // Process handle not inheritable
                        nullptr, // Thread handle not inheritable
-                       TRUE,    // Inherit file handles
-                       CREATE_NEW_PROCESS_GROUP, // Create a new process group
+                       TRUE,    // use iH to share handles
+                       CREATE_NEW_PROCESS_GROUP | // Create a new process group
+                           EXTENDED_STARTUPINFO_PRESENT, // use STARTUPINFOEX
                        nullptr, // Use parent's environment block
                        nullptr, // Use parent's starting directory
                        &si,     // Pointer to STARTUPINFO structure
                        &pi)     // Pointer to PROCESS_INFORMATION structure
     )
     {
+        auto lastErr = FileSystemException::getLastErrorString();
+
         if (si.hStdOutput != NULL)
         {
             CloseHandle(si.hStdOutput);
         }
-        CLOG(ERROR, "Process") << "CreateProcess() failed: " << GetLastError();
+        CLOG(ERROR, "Process") << "CreateProcess() failed: " << lastErr;
+
         throw std::runtime_error("CreateProcess() failed");
     }
     CloseHandle(si.hStdOutput);
@@ -281,42 +450,53 @@ ProcessExitEvent::Impl::run()
             }
             ec = asio::error_code(exitCode, asio::system_category());
         }
-        manager->handleProcessTermination(sf->mProcessId, ec.value());
+        ec = manager->handleProcessTermination(sf->mProcessId, ec.value());
         sf->cancel(ec);
     });
     mRunning = true;
 }
 
-void
+asio::error_code
 ProcessManagerImpl::handleProcessTermination(int pid, int /*status*/)
 {
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
-    mImpls.erase(pid);
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+    auto ec = asio::error_code();
+    auto process = mProcesses.find(pid);
+    if (process != mProcesses.end() && !process->second->mImpl->finish())
+    {
+        ec = asio::error_code(asio::error::try_again, asio::system_category());
+    }
+    mProcesses.erase(pid);
+    return ec;
 }
 
-void
-ProcessManagerImpl::cleanShutdown(ProcessExitEvent::Impl& impl)
+bool
+ProcessManagerImpl::cleanShutdown(ProcessExitEvent& pe)
 {
-    if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, impl.getProcessId()))
+    if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, pe.mImpl->getProcessId()))
     {
         CLOG(WARNING, "Process")
             << "failed to cleanly shutdown process with pid "
-            << impl.getProcessId() << ", error code " << GetLastError();
+            << pe.mImpl->getProcessId() << ", error code " << GetLastError();
+        return false;
     }
+    return true;
 }
 
-void
-ProcessManagerImpl::forceShutdown(ProcessExitEvent::Impl& impl)
+bool
+ProcessManagerImpl::forceShutdown(ProcessExitEvent& pe)
 {
-    if (!TerminateProcess(impl.mProcessHandle.native_handle(), 1))
+    if (!TerminateProcess(pe.mImpl->mProcessHandle.native_handle(), 1))
     {
         CLOG(WARNING, "Process")
             << "failed to force shutdown of process with pid "
-            << impl.getProcessId() << ", error code " << GetLastError();
+            << pe.mImpl->getProcessId() << ", error code " << GetLastError();
+        return false;
     }
     // Cancel any pending events on the handle. Ignore error code
     asio::error_code dummy;
-    impl.mProcessHandle.cancel(dummy);
+    pe.mImpl->mProcessHandle.cancel(dummy);
+    return true;
 }
 
 #else
@@ -326,17 +506,19 @@ ProcessManagerImpl::forceShutdown(ProcessExitEvent::Impl& impl)
 
 ProcessManagerImpl::ProcessManagerImpl(Application& app)
     : mMaxProcesses(app.getConfig().MAX_CONCURRENT_SUBPROCESSES)
-    , mIOService(app.getClock().getIOService())
-    , mSigChild(mIOService, SIGCHLD)
+    , mIOContext(app.getClock().getIOContext())
+    , mSigChild(mIOContext, SIGCHLD)
+    , mTmpDir(
+          std::make_unique<TmpDir>(app.getTmpDirManager().tmpDir("process")))
 {
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
     startSignalWait();
 }
 
 void
 ProcessManagerImpl::startSignalWait()
 {
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
     mSigChild.async_wait(
         std::bind(&ProcessManagerImpl::handleSignalWait, this));
 }
@@ -350,10 +532,10 @@ ProcessManagerImpl::handleSignalWait()
     }
     // Store tuples (pid, status)
     std::vector<std::tuple<int, int>> signaledChildren;
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
-    for (auto const& implPair : mImpls)
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+    for (auto const& pair : mProcesses)
     {
-        const int pid = implPair.first;
+        const int pid = pair.first;
         int status = 0;
         // If we find the child for which we received this SIGCHLD signal,
         // store the pid and status
@@ -378,19 +560,20 @@ ProcessManagerImpl::handleSignalWait()
     startSignalWait();
 }
 
-void
+asio::error_code
 ProcessManagerImpl::handleProcessTermination(int pid, int status)
 {
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
-    auto pair = mImpls.find(pid);
-    if (pair == mImpls.end())
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+    auto ec = asio::error_code();
+
+    auto pair = mProcesses.find(pid);
+    if (pair == mProcesses.end())
     {
         CLOG(DEBUG, "Process") << "failed to find process with pid " << pid;
-        return;
+        return ec;
     }
-    auto impl = pair->second;
+    auto impl = pair->second->mImpl;
 
-    asio::error_code ec;
     if (WIFEXITED(status))
     {
         if (WEXITSTATUS(status) == 0)
@@ -442,36 +625,46 @@ ProcessManagerImpl::handleProcessTermination(int pid, int status)
         ec = asio::error_code(1, asio::system_category());
     }
 
+    if (!impl->finish())
+    {
+        ec = asio::error_code(asio::error::try_again, asio::system_category());
+    }
+
     --gNumProcessesActive;
-    mImpls.erase(pair);
+    mProcesses.erase(pair);
 
     // Fire off any new processes we've made room for before we
     // trigger the callback.
     maybeRunPendingProcesses();
 
     impl->cancel(ec);
+    return ec;
 }
 
-void
-ProcessManagerImpl::cleanShutdown(ProcessExitEvent::Impl& impl)
+bool
+ProcessManagerImpl::cleanShutdown(ProcessExitEvent& pe)
 {
-    const int pid = impl.getProcessId();
+    const int pid = pe.mImpl->getProcessId();
     if (kill(pid, SIGINT) != 0)
     {
         CLOG(WARNING, "Process")
             << "kill (SIGINT) failed for pid " << pid << ", errno " << errno;
+        return false;
     }
+    return true;
 }
 
-void
-ProcessManagerImpl::forceShutdown(ProcessExitEvent::Impl& impl)
+bool
+ProcessManagerImpl::forceShutdown(ProcessExitEvent& pe)
 {
-    const int pid = impl.getProcessId();
+    const int pid = pe.mImpl->getProcessId();
     if (kill(pid, SIGKILL) != 0)
     {
         CLOG(WARNING, "Process")
             << "kill (SIGKILL) failed for pid " << pid << ", errno " << errno;
+        return false;
     }
+    return true;
 }
 
 static std::vector<std::string>
@@ -488,7 +681,7 @@ void
 ProcessExitEvent::Impl::run()
 {
     auto manager = mProcManagerImpl.lock();
-    assert(!manager->isShutdown());
+    assert(manager && !manager->isShutdown());
     if (mRunning)
     {
         CLOG(ERROR, "Process") << "ProcessExitEvent::Impl already running";
@@ -506,17 +699,30 @@ ProcessExitEvent::Impl::run()
     PosixSpawnFileActions fileActions;
     if (!mOutFile.empty())
     {
-        fileActions.addOpen(1, mOutFile, O_RDWR | O_CREAT, 0600);
+        fileActions.addOpen(1, mTempFile, O_RDWR | O_CREAT, 0600);
     }
     // Iterate through all possibly open file descriptors except stdin, stdout,
     // and stderr and set FD_CLOEXEC so the subprocess doesn't inherit them
     const int maxFds = sysconf(_SC_OPEN_MAX);
-    for (int fd = 3; fd < maxFds; ++fd)
+    // as the space of open file descriptors is arbitrary large
+    // we use as a heuristic the number of consecutive unused descriptors
+    // as an indication that we're past the range where descriptors are
+    // allocated
+    // a better way would be to enumerate the opened descriptors, but there
+    // doesn't seem to be a portable way to do this
+    const int maxGAP = 512;
+    for (int fd = 3, lastFd = 3; (fd < maxFds) && ((fd - lastFd) < maxGAP);
+         ++fd)
     {
         int flags = fcntl(fd, F_GETFD);
         if (flags != -1)
         {
-            fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+            // set if it was not already set
+            if ((flags & FD_CLOEXEC) == 0)
+            {
+                fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+            }
+            lastFd = fd;
         }
     }
     err = posix_spawnp(&mProcessId, argv[0], fileActions,
@@ -533,20 +739,25 @@ ProcessExitEvent::Impl::run()
 
 #endif
 
-ProcessExitEvent
+std::weak_ptr<ProcessExitEvent>
 ProcessManagerImpl::runProcess(std::string const& cmdLine, std::string outFile)
 {
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
-    ProcessExitEvent pe(mIOService);
-    std::shared_ptr<ProcessManagerImpl> self =
-        std::static_pointer_cast<ProcessManagerImpl>(shared_from_this());
-    std::weak_ptr<ProcessManagerImpl> weakSelf(self);
-    pe.mImpl = std::make_shared<ProcessExitEvent::Impl>(
-        pe.mTimer, pe.mEc, cmdLine, outFile, weakSelf);
-    mPendingImpls.push_back(pe.mImpl);
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+    auto pe =
+        std::shared_ptr<ProcessExitEvent>(new ProcessExitEvent(mIOContext));
+
+    std::weak_ptr<ProcessManagerImpl> weakSelf(
+        std::static_pointer_cast<ProcessManagerImpl>(shared_from_this()));
+
+    auto tempFile =
+        mTmpDir->getName() + "/temp-" + std::to_string(mTempFileCount++);
+
+    pe->mImpl = std::make_shared<ProcessExitEvent::Impl>(
+        pe->mTimer, pe->mEc, cmdLine, outFile, tempFile, weakSelf);
+    mPending.push_back(pe);
 
     maybeRunPendingProcesses();
-    return pe;
+    return std::weak_ptr<ProcessExitEvent>(pe);
 }
 
 void
@@ -556,30 +767,36 @@ ProcessManagerImpl::maybeRunPendingProcesses()
     {
         return;
     }
-    std::lock_guard<std::recursive_mutex> guard(mImplsMutex);
-    while (!mPendingImpls.empty() && gNumProcessesActive < mMaxProcesses)
+    std::lock_guard<std::recursive_mutex> guard(mProcessesMutex);
+    while (!mPending.empty() && gNumProcessesActive < mMaxProcesses)
     {
-        auto i = mPendingImpls.front();
-        mPendingImpls.pop_front();
+        auto i = mPending.front();
+        mPending.pop_front();
         try
         {
-            CLOG(DEBUG, "Process") << "Running: " << i->mCmdLine;
+            CLOG(DEBUG, "Process") << "Running: " << i->mImpl->mCmdLine;
 
-            i->run();
-            mImpls[i->getProcessId()] = i;
+            if (fs::exists(i->mImpl->mOutFile))
+            {
+                throw std::runtime_error(fmt::format(
+                    "output file {} already exists", i->mImpl->mOutFile));
+            }
+
+            i->mImpl->run();
+            mProcesses[i->mImpl->getProcessId()] = i;
             ++gNumProcessesActive;
         }
         catch (std::runtime_error& e)
         {
-            i->cancel(std::make_error_code(std::errc::io_error));
+            i->mImpl->cancel(std::make_error_code(std::errc::io_error));
             CLOG(ERROR, "Process") << "Error starting process: " << e.what();
-            CLOG(ERROR, "Process") << "When running: " << i->mCmdLine;
+            CLOG(ERROR, "Process") << "When running: " << i->mImpl->mCmdLine;
         }
     }
 }
 
-ProcessExitEvent::ProcessExitEvent(asio::io_service& io_service)
-    : mTimer(std::make_shared<RealTimer>(io_service))
+ProcessExitEvent::ProcessExitEvent(asio::io_context& io_context)
+    : mTimer(std::make_shared<RealTimer>(io_context))
     , mImpl(nullptr)
     , mEc(std::make_shared<asio::error_code>())
 {

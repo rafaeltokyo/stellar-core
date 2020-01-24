@@ -18,7 +18,9 @@
 #include "history/StateSnapshot.h"
 #include "historywork/FetchRecentQsetsWork.h"
 #include "historywork/PublishWork.h"
-#include "historywork/RepairMissingBucketsWork.h"
+#include "historywork/PutSnapshotFilesWork.h"
+#include "historywork/ResolveSnapshotWork.h"
+#include "historywork/WriteSnapshotWork.h"
 #include "ledger/LedgerManager.h"
 #include "lib/util/format.h"
 #include "main/Application.h"
@@ -27,11 +29,12 @@
 #include "medida/metrics_registry.h"
 #include "overlay/StellarXDR.h"
 #include "process/ProcessManager.h"
+#include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/Math.h"
 #include "util/StatusManager.h"
 #include "util/TmpDir.h"
-#include "work/WorkManager.h"
+#include "work/WorkScheduler.h"
 #include "xdrpp/marshal.h"
 
 #include <fstream>
@@ -65,19 +68,12 @@ HistoryManagerImpl::HistoryManagerImpl(Application& app)
     : mApp(app)
     , mWorkDir(nullptr)
     , mPublishWork(nullptr)
-
-    , mPublishSkip(
-          app.getMetrics().NewMeter({"history", "publish", "skip"}, "event"))
-    , mPublishQueue(
-          app.getMetrics().NewMeter({"history", "publish", "queue"}, "event"))
-    , mPublishDelay(
-          app.getMetrics().NewMeter({"history", "publish", "delay"}, "event"))
-    , mPublishStart(
-          app.getMetrics().NewMeter({"history", "publish", "start"}, "event"))
     , mPublishSuccess(
           app.getMetrics().NewMeter({"history", "publish", "success"}, "event"))
     , mPublishFailure(
           app.getMetrics().NewMeter({"history", "publish", "failure"}, "event"))
+    , mEnqueueToPublishTimer(
+          app.getMetrics().NewTimer({"history", "publish", "time"}))
 {
 }
 
@@ -179,21 +175,12 @@ HistoryManagerImpl::localFilename(std::string const& basename)
     return this->getTmpDir() + "/" + basename;
 }
 
-HistoryArchiveState
-HistoryManagerImpl::getLastClosedHistoryArchiveState() const
-{
-    auto seq =
-        mApp.getLedgerManager().getLastClosedLedgerHeader().header.ledgerSeq;
-    auto& bl = mApp.getBucketManager().getBucketList();
-    return HistoryArchiveState(seq, bl);
-}
-
 InferredQuorum
-HistoryManagerImpl::inferQuorum()
+HistoryManagerImpl::inferQuorum(uint32_t ledgerNum)
 {
     InferredQuorum iq;
     CLOG(INFO, "History") << "Starting FetchRecentQsetsWork";
-    mApp.getWorkManager().executeWork<FetchRecentQsetsWork>(iq);
+    mApp.getWorkScheduler().executeWork<FetchRecentQsetsWork>(iq, ledgerNum);
     return iq;
 }
 
@@ -236,7 +223,7 @@ HistoryManagerImpl::getMaxLedgerQueuedToPublish()
 bool
 HistoryManagerImpl::maybeQueueHistoryCheckpoint()
 {
-    uint32_t seq = mApp.getLedgerManager().getLedgerNum();
+    uint32_t seq = mApp.getLedgerManager().getLastClosedLedgerNum() + 1;
     if (seq != nextCheckpointLedger(seq))
     {
         return false;
@@ -244,7 +231,6 @@ HistoryManagerImpl::maybeQueueHistoryCheckpoint()
 
     if (!mApp.getHistoryArchiveManager().hasAnyWritableHistoryArchive())
     {
-        mPublishSkip.Mark();
         CLOG(DEBUG, "History")
             << "Skipping checkpoint, no writable history archives";
         return false;
@@ -257,10 +243,12 @@ HistoryManagerImpl::maybeQueueHistoryCheckpoint()
 void
 HistoryManagerImpl::queueCurrentHistory()
 {
-    auto has = getLastClosedHistoryArchiveState();
+    auto ledger = mApp.getLedgerManager().getLastClosedLedgerNum();
+    HistoryArchiveState has(ledger, mApp.getBucketManager().getBucketList());
 
-    auto ledger = has.currentLedger;
     CLOG(DEBUG, "History") << "Queueing publish state for ledger " << ledger;
+    mEnqueueTimes.emplace(ledger, std::chrono::steady_clock::now());
+
     auto state = has.toString();
     auto timer = mApp.getDatabase().getInsertTimer("publishqueue");
     auto prep = mApp.getDatabase().getPreparedStatement(
@@ -279,9 +267,8 @@ HistoryManagerImpl::queueCurrentHistory()
     // into the in-memory publish queue in order to preserve those
     // merges-in-progress, avoid restarting them.
 
-    mPublishQueue.Mark();
+    mPublishQueued++;
     mPublishQueueBuckets.addBuckets(has.allBuckets());
-    takeSnapshotAndPublish(has);
 }
 
 void
@@ -289,21 +276,48 @@ HistoryManagerImpl::takeSnapshotAndPublish(HistoryArchiveState const& has)
 {
     if (mPublishWork)
     {
-        mPublishDelay.Mark();
         return;
     }
+    // Ensure no merges are in-progress, and capture the bucket list hashes
+    // *before* doing the actual publish. This ensures that the HAS is in
+    // pristine state as returned by the database.
+    for (auto const& bucket : has.currentBuckets)
+    {
+        assert(!bucket.next.isLive());
+    }
+    auto allBucketsFromHAS = has.allBuckets();
     auto ledgerSeq = has.currentLedger;
     CLOG(DEBUG, "History") << "Activating publish for ledger " << ledgerSeq;
     auto snap = std::make_shared<StateSnapshot>(mApp, has);
 
-    mPublishStart.Mark();
-    mPublishWork = mApp.getWorkManager().addWork<PublishWork>(snap);
-    mApp.getWorkManager().advanceChildren();
+    // Phase 1: resolve futures in snapshot
+    auto resolveFutures = std::make_shared<ResolveSnapshotWork>(mApp, snap);
+    // Phase 2: write snapshot files
+    auto writeSnap = std::make_shared<WriteSnapshotWork>(mApp, snap);
+    // Phase 3: update archives
+    auto putSnap = std::make_shared<PutSnapshotFilesWork>(mApp, snap);
+
+    std::vector<std::shared_ptr<BasicWork>> seq{resolveFutures, writeSnap,
+                                                putSnap};
+    // Pass in all bucket hashes from HAS. We cannot rely on StateSnapshot
+    // buckets here, because its buckets might have some futures resolved by
+    // now, differing from the state of the bucketlist during queueing.
+    mPublishWork = mApp.getWorkScheduler().scheduleWork<PublishWork>(
+        snap, seq, allBucketsFromHAS);
 }
 
 size_t
 HistoryManagerImpl::publishQueuedHistory()
 {
+#ifdef BUILD_TESTS
+    if (!mPublicationEnabled)
+    {
+        CLOG(INFO, "History")
+            << "Publication explicitly disabled, so not publishing";
+        return 0;
+    }
+#endif
+
     std::string state;
 
     auto prep = mApp.getDatabase().getPreparedStatement(
@@ -328,6 +342,7 @@ std::vector<HistoryArchiveState>
 HistoryManagerImpl::getPublishQueueStates()
 {
     std::vector<HistoryArchiveState> states;
+
     std::string state;
     auto prep = mApp.getDatabase().getPreparedStatement(
         "SELECT state FROM publishqueue;");
@@ -398,6 +413,18 @@ HistoryManagerImpl::historyPublished(
 {
     if (success)
     {
+        auto iter = mEnqueueTimes.find(ledgerSeq);
+        if (iter != mEnqueueTimes.end())
+        {
+            auto now = std::chrono::steady_clock::now();
+            CLOG(DEBUG, "Perf")
+                << "Published history for ledger " << ledgerSeq << " in "
+                << std::chrono::duration<double>(now - iter->second).count()
+                << " seconds";
+            mEnqueueToPublishTimer.Update(now - iter->second);
+            mEnqueueTimes.erase(iter);
+        }
+
         this->mPublishSuccess.Mark();
         auto timer = mApp.getDatabase().getDeleteTimer("publishqueue");
         auto prep = mApp.getDatabase().getPreparedStatement(
@@ -414,42 +441,35 @@ HistoryManagerImpl::historyPublished(
         this->mPublishFailure.Mark();
     }
     mPublishWork.reset();
-    mApp.getClock().getIOService().post(
-        [this]() { this->publishQueuedHistory(); });
-}
-
-void
-HistoryManagerImpl::downloadMissingBuckets(
-    HistoryArchiveState desiredState,
-    std::function<void(asio::error_code const& ec)> handler)
-{
-    CLOG(INFO, "History") << "Starting RepairMissingBucketsWork";
-    mApp.getWorkManager().addWork<RepairMissingBucketsWork>(desiredState,
-                                                            handler);
-    mApp.getWorkManager().advanceChildren();
+    mApp.postOnMainThread([this]() { this->publishQueuedHistory(); },
+                          "HistoryManagerImpl: publishQueuedHistory");
 }
 
 uint64_t
-HistoryManagerImpl::getPublishQueueCount()
+HistoryManagerImpl::getPublishQueueCount() const
 {
-    return mPublishQueue.count();
+    return mPublishQueued;
 }
 
 uint64_t
-HistoryManagerImpl::getPublishDelayCount()
-{
-    return mPublishDelay.count();
-}
-
-uint64_t
-HistoryManagerImpl::getPublishSuccessCount()
+HistoryManagerImpl::getPublishSuccessCount() const
 {
     return mPublishSuccess.count();
 }
 
 uint64_t
-HistoryManagerImpl::getPublishFailureCount()
+HistoryManagerImpl::getPublishFailureCount() const
 {
     return mPublishFailure.count();
 }
+
+#ifdef BUILD_TESTS
+void
+HistoryManagerImpl::setPublicationEnabled(bool enabled)
+{
+    CLOG(INFO, "History") << (enabled ? "Enabling" : "Disabling")
+                          << " history publication";
+    mPublicationEnabled = enabled;
+}
+#endif
 }

@@ -53,6 +53,76 @@ It then follows that:
 
 # List of releases
 
+## v12.1.0 (2019-10-24)
+
+* `SCP` - protocol - added `CRITICAL` quality to quorum config generator
+
+## v12.0.0 (2019-09-30)
+
+* `Ledger` - protocol - CAP0024 - Make PathPayment symmetrical
+* `Ledger` - protocol - CAP0025 - Remove bucket shadowing
+* `Ledger` - protocol - CAP0026 - Disable inflation
+
+## v11.4.0 (2019-08-28)
+
+* `Herder` - security - connection string to the database could be logged unencrypted
+    * exploited: no
+    * mitigation: code fix
+
+## v11.2.0 (2019-06-27)
+
+* `SCP` - protocol - switch to auto generated quorum configuration
+* `SCP` - protocol - persist SCP messages across restarts, increasing the chance of propagating externalize messages
+* `SCP` - protocol - added quorum intersection monitoring
+* `Ledger` - protocol - changed to reject a ledger containing an unknown upgrade instead of corrupting the local ledger state
+
+## v11.1.0 (2019-05-23)
+
+* `Ledger` - security - crash when processing bad archive files
+    * exploited: no
+    * mitigation: code fix
+* `Overlay` - security - ignore SCP messages from a previous incarnation of the network (testnet reset)
+    * exploited: no
+    * mitigation: code fix
+
+## v11.0.0 (2019-04-24)
+
+* `Ledger` - protocol - implementing CAP0005 (Transaction pricing improvement)
+
+* `Ledger` - protocol - implementing CAP0006 (ManageBuyOffer)
+
+* `Ledger` - protocol - implementing CAP0020 (Bucket Initial Entries)
+
+* `Overlay` - security - memory exhaustion from validators not in Quorum (DDoS)
+    * exploited: no
+    * mitigation: code fix
+    * bug bounty: [ahook](https://hackerone.com/ahook)
+
+* `SCP` - protocol - attach validator ID to values introduced by that validator
+
+## v10.0.0 (2018-09-05)
+
+* `Ledger` - protocol - new `bumpSeqOp`, implementing CAP0001
+
+* `Ledger` - protocol - updated signature verification, to be done at transaction
+apply step. implements CAP0002
+
+* `Ledger` - protocol - add liabilities to offers, implements CAP0003
+
+* `Ledger` - security - rounding error could allow dust trades to make large error.
+    * exploited: yes
+        * over the course of a few weeks preceding the upgrade to 10, some
+         bots performed dust trades.
+        * Impact is determined by the ratio between assets. For example with
+        P=1/20,000 a rounding error of 10E-7 (1 in absolute term), is equivalent
+        to a 20,000:1 error (effective P is 1.0 instead of 1/20,000)
+    * mitigation: CAP0004 implemented in protocol 10
+
+* `Ledger` - protocol - fast fail attempts to `changeTrustOp` on native.
+
+* `Ledger` - protocol - fast fail `setOptionsOp` when attempting to set weight
+of a signer to more than 255.
+
 ## v9.2.0 (2018-03-20)
 
 * `Herder` - protocol - properly compute next ledger start time (could lead to rounds starting too early).
